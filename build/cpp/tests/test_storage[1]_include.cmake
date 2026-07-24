@@ -1,0 +1,5 @@
+if(EXISTS "D:/dev/projects/hylis/build/cpp/tests/test_storage[1]_tests.cmake")
+  include("D:/dev/projects/hylis/build/cpp/tests/test_storage[1]_tests.cmake")
+else()
+  add_test(test_storage_NOT_BUILT test_storage_NOT_BUILT)
+endif()

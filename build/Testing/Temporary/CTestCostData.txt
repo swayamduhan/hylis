@@ -1,0 +1,13 @@
+Storage.PutGetRoundtrip 3 0.00456027
+Storage.PutUpdatesSameKey 3 0.00460843
+Storage.DeleteExistingAndMissing 3 0.00449297
+Storage.IterationReturnsAllRecords 3 0.00495507
+Storage.StateSurvivesReopenViaWalReplay 3 0.00672047
+Storage.EmptyStoreReopensEmpty 3 0.0036521
+Storage.WalLsnMonotonicAndContinuesAcrossReopen 3 0.00416577
+Storage.CheckpointTruncatesWalAndRestoresState 1 0.056416
+Storage.TornFinalWalLineIsSkippedNotFatal 3 0.00470013
+Storage.WriteAheadOrderingMemoryNeverAheadOfLog 3 0.00538567
+Storage.UnknownWalOpRejected 3 0.00455507
+Storage.PayloadWithSpecialCharsSurvivesRoundtrip 3 0.0042419
+---

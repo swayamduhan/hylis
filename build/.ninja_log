@@ -1,0 +1,13 @@
+# ninja log v7
+51	1844	8065454908662786	_deps/googletest-build/googletest/CMakeFiles/gtest_main.dir/src/gtest_main.cc.obj	4ee8c79b9e221569
+62	2622	8065454908772777	_deps/googletest-build/googlemock/CMakeFiles/gmock_main.dir/src/gmock_main.cc.obj	d964e6f7a5a435fa
+45	3729	8065454908612787	_deps/googletest-build/googlemock/CMakeFiles/gmock.dir/src/gmock-all.cc.obj	40a6582794612ef0
+40	8245	8065454908562781	_deps/googletest-build/googletest/CMakeFiles/gtest.dir/src/gtest-all.cc.obj	3faa91eceaa61963
+38	666	8065455552839145	lib/libgtest.a	9e43b50f3892ffa6
+674	777	8065455559195565	lib/libgtest_main.a	20f2dd4d3af88fea
+667	806	8065455559125593	lib/libgmock.a	726fbf44b323832a
+807	893	8065455560521012	lib/libgmock_main.a	b7a8bc12cec7e112
+42	3536	8065456784390952	cpp/tests/CMakeFiles/test_storage.dir/test_storage.cpp.obj	44f1d6977c63f585
+3537	5036	8065456834228233	cpp/tests/test_storage.exe	1af8ccbc13d0f349
+3537	5036	8065456834228233	cpp/tests/test_storage[1]_tests.cmake	1af8ccbc13d0f349
+3537	5036	8065456834228233	D:/dev/projects/hylis/build/cpp/tests/test_storage[1]_tests.cmake	1af8ccbc13d0f349

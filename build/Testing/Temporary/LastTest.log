@@ -1,0 +1,327 @@
+Start testing: Jul 24 03:04 India Standard Time
+----------------------------------------------------------
+1/12 Testing: Storage.PutGetRoundtrip
+1/12 Test: Storage.PutGetRoundtrip
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.PutGetRoundtrip" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.PutGetRoundtrip" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.PutGetRoundtrip
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.PutGetRoundtrip
+[       OK ] Storage.PutGetRoundtrip (4 ms)
+[----------] 1 test from Storage (4 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (4 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.PutGetRoundtrip" end time: Jul 24 03:04 India Standard Time
+"Storage.PutGetRoundtrip" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/12 Testing: Storage.PutUpdatesSameKey
+2/12 Test: Storage.PutUpdatesSameKey
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.PutUpdatesSameKey" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.PutUpdatesSameKey" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.PutUpdatesSameKey
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.PutUpdatesSameKey
+[       OK ] Storage.PutUpdatesSameKey (3 ms)
+[----------] 1 test from Storage (3 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (3 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.PutUpdatesSameKey" end time: Jul 24 03:04 India Standard Time
+"Storage.PutUpdatesSameKey" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/12 Testing: Storage.DeleteExistingAndMissing
+3/12 Test: Storage.DeleteExistingAndMissing
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.DeleteExistingAndMissing" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.DeleteExistingAndMissing" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.DeleteExistingAndMissing
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.DeleteExistingAndMissing
+[       OK ] Storage.DeleteExistingAndMissing (4 ms)
+[----------] 1 test from Storage (4 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (4 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.DeleteExistingAndMissing" end time: Jul 24 03:04 India Standard Time
+"Storage.DeleteExistingAndMissing" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/12 Testing: Storage.IterationReturnsAllRecords
+4/12 Test: Storage.IterationReturnsAllRecords
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.IterationReturnsAllRecords" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.IterationReturnsAllRecords" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.IterationReturnsAllRecords
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.IterationReturnsAllRecords
+[       OK ] Storage.IterationReturnsAllRecords (5 ms)
+[----------] 1 test from Storage (5 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (5 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.IterationReturnsAllRecords" end time: Jul 24 03:04 India Standard Time
+"Storage.IterationReturnsAllRecords" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/12 Testing: Storage.StateSurvivesReopenViaWalReplay
+5/12 Test: Storage.StateSurvivesReopenViaWalReplay
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.StateSurvivesReopenViaWalReplay" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.StateSurvivesReopenViaWalReplay" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.StateSurvivesReopenViaWalReplay
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.StateSurvivesReopenViaWalReplay
+[       OK ] Storage.StateSurvivesReopenViaWalReplay (11 ms)
+[----------] 1 test from Storage (11 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (11 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.StateSurvivesReopenViaWalReplay" end time: Jul 24 03:04 India Standard Time
+"Storage.StateSurvivesReopenViaWalReplay" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/12 Testing: Storage.EmptyStoreReopensEmpty
+6/12 Test: Storage.EmptyStoreReopensEmpty
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.EmptyStoreReopensEmpty" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.EmptyStoreReopensEmpty" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.EmptyStoreReopensEmpty
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.EmptyStoreReopensEmpty
+[       OK ] Storage.EmptyStoreReopensEmpty (2 ms)
+[----------] 1 test from Storage (2 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (2 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.EmptyStoreReopensEmpty" end time: Jul 24 03:04 India Standard Time
+"Storage.EmptyStoreReopensEmpty" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/12 Testing: Storage.WalLsnMonotonicAndContinuesAcrossReopen
+7/12 Test: Storage.WalLsnMonotonicAndContinuesAcrossReopen
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.WalLsnMonotonicAndContinuesAcrossReopen" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.WalLsnMonotonicAndContinuesAcrossReopen" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.WalLsnMonotonicAndContinuesAcrossReopen
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.WalLsnMonotonicAndContinuesAcrossReopen
+[       OK ] Storage.WalLsnMonotonicAndContinuesAcrossReopen (4 ms)
+[----------] 1 test from Storage (4 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (4 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.WalLsnMonotonicAndContinuesAcrossReopen" end time: Jul 24 03:04 India Standard Time
+"Storage.WalLsnMonotonicAndContinuesAcrossReopen" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/12 Testing: Storage.CheckpointTruncatesWalAndRestoresState
+8/12 Test: Storage.CheckpointTruncatesWalAndRestoresState
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.CheckpointTruncatesWalAndRestoresState" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.CheckpointTruncatesWalAndRestoresState" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.CheckpointTruncatesWalAndRestoresState
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.CheckpointTruncatesWalAndRestoresState
+[       OK ] Storage.CheckpointTruncatesWalAndRestoresState (48 ms)
+[----------] 1 test from Storage (48 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (48 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.CheckpointTruncatesWalAndRestoresState" end time: Jul 24 03:04 India Standard Time
+"Storage.CheckpointTruncatesWalAndRestoresState" time elapsed: 00:00:00
+----------------------------------------------------------
+
+9/12 Testing: Storage.TornFinalWalLineIsSkippedNotFatal
+9/12 Test: Storage.TornFinalWalLineIsSkippedNotFatal
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.TornFinalWalLineIsSkippedNotFatal" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.TornFinalWalLineIsSkippedNotFatal" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.TornFinalWalLineIsSkippedNotFatal
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.TornFinalWalLineIsSkippedNotFatal
+[       OK ] Storage.TornFinalWalLineIsSkippedNotFatal (5 ms)
+[----------] 1 test from Storage (5 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (5 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.TornFinalWalLineIsSkippedNotFatal" end time: Jul 24 03:04 India Standard Time
+"Storage.TornFinalWalLineIsSkippedNotFatal" time elapsed: 00:00:00
+----------------------------------------------------------
+
+10/12 Testing: Storage.WriteAheadOrderingMemoryNeverAheadOfLog
+10/12 Test: Storage.WriteAheadOrderingMemoryNeverAheadOfLog
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.WriteAheadOrderingMemoryNeverAheadOfLog" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.WriteAheadOrderingMemoryNeverAheadOfLog" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.WriteAheadOrderingMemoryNeverAheadOfLog
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.WriteAheadOrderingMemoryNeverAheadOfLog
+[       OK ] Storage.WriteAheadOrderingMemoryNeverAheadOfLog (7 ms)
+[----------] 1 test from Storage (7 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (7 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.WriteAheadOrderingMemoryNeverAheadOfLog" end time: Jul 24 03:04 India Standard Time
+"Storage.WriteAheadOrderingMemoryNeverAheadOfLog" time elapsed: 00:00:00
+----------------------------------------------------------
+
+11/12 Testing: Storage.UnknownWalOpRejected
+11/12 Test: Storage.UnknownWalOpRejected
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.UnknownWalOpRejected" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.UnknownWalOpRejected" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.UnknownWalOpRejected
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.UnknownWalOpRejected
+[       OK ] Storage.UnknownWalOpRejected (2 ms)
+[----------] 1 test from Storage (2 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (2 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.UnknownWalOpRejected" end time: Jul 24 03:04 India Standard Time
+"Storage.UnknownWalOpRejected" time elapsed: 00:00:00
+----------------------------------------------------------
+
+12/12 Testing: Storage.PayloadWithSpecialCharsSurvivesRoundtrip
+12/12 Test: Storage.PayloadWithSpecialCharsSurvivesRoundtrip
+Command: "D:/dev/projects/hylis/build/cpp/tests/test_storage.exe" "--gtest_filter=Storage.PayloadWithSpecialCharsSurvivesRoundtrip" "--gtest_also_run_disabled_tests"
+Directory: D:/dev/projects/hylis/build/cpp/tests
+"Storage.PayloadWithSpecialCharsSurvivesRoundtrip" start time: Jul 24 03:04 India Standard Time
+Output:
+----------------------------------------------------------
+Running main() from D:/dev/projects/hylis/build/_deps/googletest-src/googletest/src/gtest_main.cc
+Note: Google Test filter = Storage.PayloadWithSpecialCharsSurvivesRoundtrip
+[==========] Running 1 test from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 1 test from Storage
+[ RUN      ] Storage.PayloadWithSpecialCharsSurvivesRoundtrip
+[       OK ] Storage.PayloadWithSpecialCharsSurvivesRoundtrip (4 ms)
+[----------] 1 test from Storage (4 ms total)
+
+[----------] Global test environment tear-down
+[==========] 1 test from 1 test suite ran. (4 ms total)
+[  PASSED  ] 1 test.
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"Storage.PayloadWithSpecialCharsSurvivesRoundtrip" end time: Jul 24 03:04 India Standard Time
+"Storage.PayloadWithSpecialCharsSurvivesRoundtrip" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Jul 24 03:04 India Standard Time

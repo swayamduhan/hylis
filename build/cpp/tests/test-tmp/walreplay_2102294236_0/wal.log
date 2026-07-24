@@ -1,0 +1,12 @@
+{"lsn":0,"op":"put","key":0,"payload":{"label":"row0"}}
+{"lsn":1,"op":"put","key":1,"payload":{"label":"row1"}}
+{"lsn":2,"op":"put","key":2,"payload":{"label":"row2"}}
+{"lsn":3,"op":"put","key":3,"payload":{"label":"row3"}}
+{"lsn":4,"op":"put","key":4,"payload":{"label":"row4"}}
+{"lsn":5,"op":"put","key":5,"payload":{"label":"row5"}}
+{"lsn":6,"op":"put","key":6,"payload":{"label":"row6"}}
+{"lsn":7,"op":"put","key":7,"payload":{"label":"row7"}}
+{"lsn":8,"op":"put","key":8,"payload":{"label":"row8"}}
+{"lsn":9,"op":"put","key":9,"payload":{"label":"row9"}}
+{"lsn":10,"op":"delete","key":3,"payload":null}
+{"lsn":11,"op":"put","key":7,"payload":{"label":"updated"}}

@@ -1,0 +1,31 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": { "major": 3, "minor": 23, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "MinGW-w64 GCC (Ninja)",
+      "description": "Use the WinLibs MinGW-w64 toolchain with Ninja. Hard-pins the compiler paths so the build is identical regardless of which shell launches CMake.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "C:/tools/mingw64/bin/gcc.exe",
+        "CMAKE_CXX_COMPILER": "C:/tools/mingw64/bin/g++.exe",
+        "CMAKE_MAKE_PROGRAM": "C:/tools/mingw64/bin/ninja.exe",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "default",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "default", "configurePreset": "default" },
+    { "name": "release", "configurePreset": "release" }
+  ],
+  "testPresets": [
+    { "name": "default", "configurePreset": "default", "output": { "outputOnFailure": true } }
+  ]
+}

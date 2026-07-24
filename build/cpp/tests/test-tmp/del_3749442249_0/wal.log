@@ -1,0 +1,2 @@
+{"lsn":0,"op":"put","key":1,"payload":{"v":"a"}}
+{"lsn":1,"op":"delete","key":1,"payload":null}
