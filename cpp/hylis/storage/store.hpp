@@ -2,39 +2,27 @@
 //
 // The record store: in-memory records made durable via the WAL.
 //
-// Responsibilities
-// ----------------
-// * Hold the authoritative in-memory state: key -> Record.
-// * Route every mutation through the WAL **first** (write-ahead rule).
-// * Recover state from the WAL on open (replay).
-// * Periodically *checkpoint*: snapshot state to a file, then truncate the WAL
-//   so recovery is fast.
-//
-// Why in-memory + WAL instead of a page store?
-// --------------------------------------------
-// This project's contribution is the *indexing* layer, not storage. An
-// in-memory hash map with a WAL gives real durability semantics (crash
-// recovery) with a tiny amount of code, so we can spend our complexity budget
-// on the B+ tree, learned index, and neural router. The WAL is the honest,
-// defensible way to add durability to an in-memory store.
+// Why in-memory + WAL instead of a page store? This project's contribution
+// is the *indexing* layer, not storage. An in-memory hash map with a WAL
+// gives real durability semantics (crash recovery) with a tiny amount of
+// code, so the complexity budget can go to the B+ tree, learned index, and
+// neural router instead. Known tradeoff: fsync-per-write caps throughput;
+// group-commit/batched fsync would be a reasonable stretch feature.
 
 #pragma once
 
 #include <algorithm>
-#include <cerrno>
-#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "storage/json_detail.hpp"
 #include "storage/record.hpp"
 #include "storage/wal.hpp"
 
@@ -52,8 +40,6 @@ public:
 
     // `recover=true` replays the WAL on open. Tests may pass false for an
     // ephemeral store that starts empty even if a stale WAL is present.
-    // Accept fs::path directly (tests create dirs via fs, and -Wpedantic
-    // disables the implicit path→string conversion). Store as path internally.
     explicit RecordStore(const fs::path& directory, bool recover = true)
         : directory_(directory) {
         fs::create_directories(directory_);
@@ -65,16 +51,16 @@ public:
     RecordStore(const RecordStore&) = delete;
     RecordStore& operator=(const RecordStore&) = delete;
 
-    // Insert or update. Ordering: WAL first (append + fsync), then memory.
-    // If we crashed after the WAL append but before the map update, recovery
-    // would still apply the put, so disk and memory converge.
+    // Insert or update. WAL first (append + fsync), then memory: if we crash
+    // after the WAL append but before the map update, recovery still applies
+    // the put, so disk and memory converge.
     void put(const Record& r) {
         wal_->append_put(r.key, r.columns);
         records_[r.key] = r;
     }
 
-    // Delete by key. Returns true iff a record was removed. We log deletes
-    // only for keys that existed, to keep the log small.
+    // Delete by key. Returns true iff a record was removed. Deletes of
+    // already-absent keys aren't logged, to keep the log small.
     bool del(std::int64_t key) {
         auto it = records_.find(key);
         if (it == records_.end()) return false;
@@ -83,7 +69,6 @@ public:
         return true;
     }
 
-    // Point lookup. O(1) hash-map access.
     const Record* get(std::int64_t key) const {
         auto it = records_.find(key);
         return it == records_.end() ? nullptr : &it->second;
@@ -108,40 +93,28 @@ public:
         return out;
     }
 
-    // Snapshot state to disk and truncate the WAL.
-    //
-    // 1. Write the snapshot to a temp file in the same dir, then std::filesystem::rename
-    //    (atomic on POSIX; on Windows it's atomic-replace when the target exists).
-    //    A crash mid-snapshot leaves the previous checkpoint intact.
-    // 2. fsync the snapshot.
-    // 3. Append a checkpoint marker, then truncate the WAL.
-    //
-    // There's a small window between writing the checkpoint and truncating the
-    // WAL where both contain overlapping data; replay is idempotent, so safe.
+    // Snapshots state to disk and truncates the WAL:
+    //   1. Write the snapshot to a temp file in the same directory, fsync,
+    //      then atomically rename over the previous checkpoint (a crash
+    //      mid-write leaves the previous checkpoint intact).
+    //   2. Truncate the WAL, then log a checkpoint marker. If we crash
+    //      between these two steps the worst case is an empty log plus a
+    //      valid checkpoint file, which recovery still handles correctly.
     void checkpoint() {
         const fs::path ckpt_path = directory_ / CHECKPOINT_NAME;
-
-        // Serialize: {"records":[[key,{"col":"v",...}], ...]}.
-        std::string blob = serialize_snapshot();
-
-        // Temp file in the SAME directory so rename stays intra-filesystem.
         const fs::path tmp_path = directory_ / ".ckpt_tmp.json";
+
         {
             std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
             if (!out) throw std::runtime_error("checkpoint: cannot open temp");
+            const std::string blob = serialize_snapshot();
             out.write(blob.data(), static_cast<std::streamsize>(blob.size()));
             out.flush();
-            out.close();
         }
         fsync_path(tmp_path);
-        fs::rename(tmp_path, ckpt_path);   // atomic replace of any prior checkpoint
+        fs::rename(tmp_path, ckpt_path); // atomic replace of any prior checkpoint
         fsync_path(ckpt_path);
 
-        // Truncate + marker. We truncate first so the marker (written second)
-        // survives in the fresh log. If a crash happens between them, the worst
-        // case is an empty log with a valid checkpoint file on disk, which
-        // recovery handles correctly (it loads the checkpoint, then replays
-        // nothing, and ends up in the right state).
         wal_->truncate();
         wal_->append_checkpoint();
     }
@@ -150,8 +123,8 @@ public:
 
     const fs::path& directory() const { return directory_; }
 
-    // Test-only accessor exposing the WAL's next LSN, so tests can assert the
-    // counter survives a reopen. Not part of the public contract.
+    // Test-only accessor so tests can assert the LSN counter survives a
+    // reopen. Not part of the public contract.
     std::int64_t wal_next_lsn_for_test() const { return wal_ ? wal_->next_lsn() : -1; }
 
 private:
@@ -161,17 +134,15 @@ private:
     std::unique_ptr<WriteAheadLog> wal_;
     RecordMap records_;
 
-    // ---- recovery -------------------------------------------------------
     void recover_state() {
-        // 1) Load checkpoint if present.
         const fs::path ckpt = directory_ / CHECKPOINT_NAME;
         if (fs::exists(ckpt)) {
             std::ifstream in(ckpt, std::ios::binary);
             std::string s((std::istreambuf_iterator<char>(in)),
                           std::istreambuf_iterator<char>());
-            parse_snapshot(s);   // fills records_
+            parse_snapshot(s);
         }
-        // 2) Replay WAL on top. Operations are idempotent under replay.
+        // Replay the WAL on top; put/delete are idempotent under replay.
         for (const auto& e : wal_->iter_entries()) apply(e);
     }
 
@@ -190,33 +161,10 @@ private:
         }
     }
 
-    // ---- snapshot serialization (same JSON dialect as the WAL) ----------
-    static void esc(std::string& out, const std::string& s) {
-        // Reuse WAL escaping logic by constructing a LogEntry line fragment.
-        // Simplest: inline the same minimal escaper (kept in sync with wal.hpp).
-        for (char c : s) {
-            switch (c) {
-                case '"':  out += "\\\""; break;
-                case '\\': out += "\\\\"; break;
-                case '\n': out += "\\n";  break;
-                case '\r': out += "\\r";  break;
-                case '\t': out += "\\t";  break;
-                case '\b': out += "\\b";  break;
-                case '\f': out += "\\f";  break;
-                default:
-                    if (static_cast<unsigned char>(c) < 0x20) {
-                        char buf[8];
-                        std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                        out += buf;
-                    } else {
-                        out += c;
-                    }
-            }
-        }
-    }
-
+    // Snapshot grammar: {"records":[[key,{"col":"val",...}], ...]}, keys
+    // sorted for deterministic, diff-friendly output. Reuses the WAL's JSON
+    // primitives rather than a second hand-rolled parser.
     std::string serialize_snapshot() const {
-        // Emit keys in sorted order for deterministic, diff-friendly snapshots.
         std::vector<std::int64_t> sorted_keys;
         sorted_keys.reserve(records_.size());
         for (const auto& [k, v] : records_) sorted_keys.push_back(k);
@@ -236,9 +184,9 @@ private:
                 if (!fc) out += ',';
                 fc = false;
                 out += '"';
-                esc(out, ck);
+                out += json_detail::escape_string(ck);
                 out += "\":\"";
-                esc(out, cv);
+                out += json_detail::escape_string(cv);
                 out += '"';
             }
             out += "}]";
@@ -248,75 +196,25 @@ private:
     }
 
     void parse_snapshot(const std::string& s) {
-        // Tiny hand-rolled parser for our exact snapshot grammar:
-        // {"records":[[k,{"c":"v",...}], ...]}
+        using namespace json_detail;
         const char* p = s.c_str();
-        auto skip_ws = [](const char*& q){ while(*q==' '||*q=='\t'||*q=='\n'||*q=='\r') ++q; };
-        auto expect = [](const char*& q, char c){ if(*q!=c) throw std::runtime_error("snapshot: parse"); ++q; };
-        auto read_string = [&](const char*& q) -> std::string {
-            expect(q, '"');
-            std::string o;
-            while (*q && *q != '"') {
-                if (*q == '\\') {
-                    ++q;
-                    switch (*q) {
-                        case '"': o += '"'; break;
-                        case '\\': o += '\\'; break;
-                        case '/': o += '/'; break;
-                        case 'b': o += '\b'; break;
-                        case 'f': o += '\f'; break;
-                        case 'n': o += '\n'; break;
-                        case 'r': o += '\r'; break;
-                        case 't': o += '\t'; break;
-                        case 'u': {
-                            ++q; char hex[5]={0};
-                            for(int i=0;i<4;++i){ if(!*q) throw std::runtime_error("bad \\u"); hex[i]=*q++; }
-                            int code = (int)std::strtol(hex,nullptr,16);
-                            if(code>0x7F) throw std::runtime_error("non-ASCII \\u unsupported");
-                            o += (char)code; --q; break;
-                        }
-                        default: throw std::runtime_error("bad esc");
-                    }
-                    ++q;
-                } else { o += *q++; }
-            }
-            expect(q, '"');
-            return o;
-        };
 
         skip_ws(p);
         expect(p, '{'); skip_ws(p);
-        // Expect a single key "records"
-        std::string key = read_string(p); skip_ws(p);
-        if (key != "records") throw std::runtime_error("snapshot: missing records");
-        expect(p, ':'); skip_ws(p); expect(p, '[');
+        if (read_string(p) != "records") throw std::runtime_error("snapshot: missing records");
+        skip_ws(p); expect(p, ':'); skip_ws(p); expect(p, '[');
         if (*p == ']') { ++p; return; }
+
         while (true) {
             skip_ws(p); expect(p, '[');
-            char* end = nullptr;
-            errno = 0;
-            long long k = std::strtoll(p, &end, 10);
-            if (end == p) throw std::runtime_error("snapshot: bad key");
-            p = end; skip_ws(p); expect(p, ','); skip_ws(p);
-            expect(p, '{');
-            std::map<std::string,std::string> cols;
-            skip_ws(p);
-            if (*p != '}') {
-                while (true) {
-                    skip_ws(p);
-                    std::string ck = read_string(p); skip_ws(p);
-                    expect(p, ':'); skip_ws(p);
-                    std::string cv = read_string(p);
-                    cols.emplace(std::move(ck), std::move(cv));
-                    skip_ws(p);
-                    if (*p == ',') { ++p; continue; }
-                    if (*p == '}') break;
-                    throw std::runtime_error("snapshot: expected , or }");
-                }
-            }
-            expect(p, '}'); skip_ws(p); expect(p, ']');
-            Record r; r.key = (std::int64_t)k; r.columns = std::move(cols);
+            const std::int64_t key = read_int(p);
+            skip_ws(p); expect(p, ','); skip_ws(p);
+            std::map<std::string, std::string> cols = read_string_object(p);
+            skip_ws(p); expect(p, ']');
+
+            Record r; r.key = key; r.columns = std::move(cols);
             records_[r.key] = std::move(r);
+
             skip_ws(p);
             if (*p == ',') { ++p; continue; }
             if (*p == ']') { ++p; break; }
@@ -324,16 +222,13 @@ private:
         }
     }
 
-    // fsync a path that we've just written via ofstream.
+    // fsync a path just written via ofstream.
     //
-    // On POSIX, opening "rb" is fine because fsync() works on any fd with a
-    // backing file regardless of the open mode.
-    //
-    // On Windows, FlushFileBuffers *requires* a handle opened with write access
-    // (else ERROR_ACCESS_DENIED / err=5). We open "r+b" (read+write, no
-    // truncation) so the handle has write access without disturbing the file.
-    // The directory fsync is best-effort: swallow errors since not all
-    // filesystems support fsyncing a directory handle.
+    // On POSIX, opening "rb" is fine — fsync() works on any fd with a
+    // backing file regardless of open mode. On Windows, FlushFileBuffers
+    // requires a handle with write access, so we open "r+b" (read+write, no
+    // truncation) instead. Directory fsync is best-effort: not every
+    // filesystem supports fsyncing a directory handle.
     static void fsync_path(const fs::path& p) {
 #ifdef _WIN32
         std::FILE* f = std::fopen(p.string().c_str(), "r+b");
@@ -341,15 +236,14 @@ private:
         std::FILE* f = std::fopen(p.string().c_str(), "rb");
 #endif
         if (f) { detail::fsync_file(f); std::fclose(f); }
-        // Directory sync (best-effort, swallow errors).
+
         const auto dir = p.parent_path().string();
-        std::FILE* d = std::fopen(dir.c_str(),
 #ifdef _WIN32
-            "r+b");
+        std::FILE* d = std::fopen(dir.c_str(), "r+b");
 #else
-            "rb");
+        std::FILE* d = std::fopen(dir.c_str(), "rb");
 #endif
-        if (d) { try { detail::fsync_file(d); } catch(...) {} std::fclose(d); }
+        if (d) { try { detail::fsync_file(d); } catch (...) {} std::fclose(d); }
     }
 };
 

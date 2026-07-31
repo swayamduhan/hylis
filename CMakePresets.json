@@ -4,14 +4,11 @@
   "configurePresets": [
     {
       "name": "default",
-      "displayName": "MinGW-w64 GCC (Ninja)",
-      "description": "Use the WinLibs MinGW-w64 toolchain with Ninja. Hard-pins the compiler paths so the build is identical regardless of which shell launches CMake.",
+      "displayName": "Ninja (compilers resolved from PATH)",
+      "description": "Uses whatever C/C++ compiler and Ninja are on PATH, so the preset works on any machine with a working toolchain rather than pinning to one dev box.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
-        "CMAKE_C_COMPILER": "C:/tools/mingw64/bin/gcc.exe",
-        "CMAKE_CXX_COMPILER": "C:/tools/mingw64/bin/g++.exe",
-        "CMAKE_MAKE_PROGRAM": "C:/tools/mingw64/bin/ninja.exe",
         "CMAKE_BUILD_TYPE": "Debug"
       }
     },

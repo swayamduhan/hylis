@@ -5,7 +5,7 @@
 //
 // Design: we bind the C++ types as closely as possible. Record is exposed as
 // a simple value type with .key (int) and .columns (dict[str,str]).
-// RecordStore gives put/get/del/checkpoint/close as methods.
+// RecordStore gives put/get/delete/checkpoint/close as methods.
 // This keeps the Python API thin — no clever abstractions to hide behind.
 
 #include <pybind11/pybind11.h>
@@ -52,7 +52,9 @@ PYBIND11_MODULE(_storage, m) {
              return r ? py::cast(*r) : py::none();
         }, py::arg("key"),
            "Point lookup by key. Returns Record or None.")
-        .def("del", &RecordStore::del, py::arg("key"),
+        // Exposed as `delete`, not `del`: `del` is a reserved keyword in
+        // Python, so `store.del(k)` would be a SyntaxError at the call site.
+        .def("delete", &RecordStore::del, py::arg("key"),
              "Delete by key. Returns True if a record was removed.")
         .def("contains", &RecordStore::contains, py::arg("key"),
              "True if the key exists.")

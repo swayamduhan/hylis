@@ -47,6 +47,24 @@ endif()
 # Export compile commands so editors / clangd can introspect the build.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ------------------------------------------------- MinGW: static C++ runtime
+# Without this, binaries depend on libstdc++-6.dll / libgcc_s_seh-1.dll, which
+# breaks in two ways on Windows:
+#   * Git for Windows ships its own copy of both in a directory that usually
+#     precedes the real toolchain on PATH, so a binary loads a mismatched
+#     libstdc++ and dies with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139).
+#   * Python 3.8+ ignores PATH when resolving an extension module's dependent
+#     DLLs, so the .pyd cannot find them at all.
+# Linking them statically makes both the test binaries and the .pyd
+# self-contained, which is also what we want for a reviewer's machine.
+# `-static` also covers libwinpthread-1.dll, which this toolchain's posix
+# threading model pulls in and which would otherwise reintroduce the same
+# problem. python3xx.dll stays dynamic (it is linked via an import library),
+# which is correct — the interpreter always provides it.
+if(MINGW)
+    add_link_options(-static-libgcc -static-libstdc++ -static)
+endif()
+
 # -------------------------------------------------------------- subdirs
 add_subdirectory(cpp/hylis)          # core static library target: hylis_core
 

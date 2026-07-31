@@ -40,9 +40,9 @@ def test_len_contains(tmpstore):
 
 def test_delete(tmpstore):
     tmpstore.put(_storage.Record(1, {"v": "a"}))
-    assert tmpstore.del(1) is True
+    assert tmpstore.delete(1) is True
     assert tmpstore.get(1) is None
-    assert tmpstore.del(1) is False
+    assert tmpstore.delete(1) is False
 
 
 def test_crash_recovery(tmp_path):
@@ -51,7 +51,7 @@ def test_crash_recovery(tmp_path):
     s = _storage.RecordStore(str(d))
     for i in range(10):
         s.put(_storage.Record(i, {"label": f"row{i}"}))
-    s.del(3)
+    s.delete(3)
     s.close()
 
     # "Crash" + reopen

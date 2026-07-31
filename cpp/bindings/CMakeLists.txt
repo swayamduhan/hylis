@@ -14,13 +14,32 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(pybind11)
 
+# Built extensions land directly inside the Python package so `import
+# hylis._storage` works straight from a build tree, with no install step and
+# no PYTHONPATH juggling beyond putting python/ on sys.path (see conftest.py).
+set(HYLIS_PY_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/python/hylis")
+
+# Declare one pybind11 module per binding source, output into the package dir.
+# `name` is the importable module name (leading underscore), `source` the .cpp.
+function(hylis_add_binding name source)
+    pybind11_add_module(${name} ${source})
+    target_link_libraries(${name} PRIVATE hylis_core)
+    # Multi-config generators (MSVC) append a per-config subdir unless the
+    # per-config property is set too, so set both.
+    set_target_properties(${name} PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${HYLIS_PY_PACKAGE_DIR}")
+    foreach(cfg ${CMAKE_CONFIGURATION_TYPES})
+        string(TOUPPER ${cfg} cfg_upper)
+        set_target_properties(${name} PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY_${cfg_upper} "${HYLIS_PY_PACKAGE_DIR}")
+    endforeach()
+endfunction()
+
 # Each binding module is declared here once its .cpp exists.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/storage.cpp")
-    pybind11_add_module(_storage storage.cpp)
-    target_link_libraries(_storage PRIVATE hylis_core)
+    hylis_add_binding(_storage storage.cpp)
 endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/btree.cpp")
-    pybind11_add_module(_btree btree.cpp)
-    target_link_libraries(_btree PRIVATE hylis_core)
+    hylis_add_binding(_btree btree.cpp)
 endif()

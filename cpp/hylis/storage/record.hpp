@@ -37,6 +37,11 @@ struct Record {
     // range algorithms, which several tests rely on.
     bool operator<(const Record& other) const { return key < other.key; }
     bool operator==(const Record& other) const { return key == other.key; }
+
+    std::string get(const std::string& name, const std::string& default_value = "") const {
+        auto it = columns.find(name);
+        return it == columns.end() ? default_value : it->second;
+    }
 };
 
 } // namespace hylis::storage
