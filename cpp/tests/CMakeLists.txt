@@ -37,4 +37,4 @@ endfunction()
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/test-tmp)
 
 hylis_add_test(test_storage)
-# hylis_add_test(test_btree)   # added once btree exists
+hylis_add_test(test_btree)

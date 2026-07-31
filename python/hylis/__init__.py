@@ -11,6 +11,7 @@ Architecture:
   hylis.index     (this file)     -> thin Python convenience wrappers
 """
 
+from hylis.index import BPlusTree, CompareOp  # noqa: F401
 from hylis.storage import Record, RecordStore  # noqa: F401
 
 __version__ = "0.1.0"

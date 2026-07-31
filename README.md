@@ -29,13 +29,32 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 ## Layout
 
 ```
-hylis/
-  storage/      # record store + write-ahead log
-  index/        # B+ tree, learned index, HNSW, neural router
-  planner/      # hybrid query planner
-  bench/        # benchmark suite
-  cli/          # demo UI
-tests/          # pytest, one file per module
+cpp/
+  hylis/
+    storage/    # record store + write-ahead log (header-only)
+    index/      # B+ tree, and later the learned index / HNSW
+  bindings/     # pybind11 modules -> hylis._storage, hylis._btree
+  tests/        # GoogleTest suites for the C++ core
+python/hylis/   # user-facing Python API; built extensions land here
+tests/          # pytest, exercising the C++ core through the bindings
 ```
 
-Python 3.11+. Core: NumPy only. Router uses PyTorch.
+The C++ core is header-only and built with CMake; the ML layers (learned
+index, neural router, planner) will be pure Python calling into that core
+in-process via pybind11.
+
+## Build and test
+
+Requires a C++17 compiler, CMake 3.18+, Ninja and Python 3.8+ on `PATH`
+(pybind11 and GoogleTest are fetched automatically).
+
+```bash
+cmake --preset default      # or: cmake -B build -G Ninja
+cmake --build build
+
+ctest --test-dir build      # C++ suites
+pytest tests/               # Python bridge suites
+```
+
+The compiled extensions are written straight into `python/hylis/`, so
+`pytest` works from a clean checkout with no install step.
