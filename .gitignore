@@ -1,2 +1,8 @@
+
 build
-.zcode
+# Compiled pybind11 extensions are built into the package dir
+python/hylis/*.pyd
+python/hylis/*.so
+__pycache__/
+*.py[cod]
+.pytest_cache/

@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"D:/dev/projects/hylis/build/_deps/googletest-subbuild/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

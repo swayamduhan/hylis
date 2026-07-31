@@ -1,3 +1,0 @@
-{"lsn":20,"op":"checkpoint","key":null,"payload":null}
-{"lsn":21,"op":"put","key":100,"payload":{"i":"100"}}
-{"lsn":22,"op":"delete","key":5,"payload":null}

@@ -1,4 +1,0 @@
-{"lsn":0,"op":"put","key":1,"payload":{}}
-{"lsn":1,"op":"put","key":2,"payload":{}}
-{"lsn":2,"op":"put","key":3,"payload":{}}
-{"lsn":3,"op":"delete","key":2,"payload":null}
