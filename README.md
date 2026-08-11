@@ -62,6 +62,19 @@ pytest tests/               # Python bridge suites
 The compiled extensions are written straight into `python/hylis/`, so
 `pytest` works from a clean checkout with no install step.
 
+## Trying the B+ tree
+
+```bash
+python scripts/try_btree.py --demo            # scripted walkthrough
+python scripts/try_btree.py --order 4         # interactive; small order splits fast
+python scripts/try_btree.py --load clustered:20000
+python scripts/try_btree.py --csv mydata.csv
+```
+
+The REPL keeps a shadow Python dict beside the tree, so `check` diffs every
+key against it and re-runs `validate()` on demand — the same differential
+idea as the C++ fuzz test, exposed so you can try to break the tree by hand.
+
 ## Data
 
 `hylis.datasets` supplies three things, matching the three things the engine
