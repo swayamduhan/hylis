@@ -18,7 +18,7 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 | 1 | Storage + WAL       | ✅ |
 | 2 | B+ Tree             | ✅ |
 | 3 | Brute-force vector  | ✅ |
-| 4 | Learned Index (RMI) | ☐ |
+| 4 | Learned Index (RMI) | ✅ |
 | 5 | HNSW baseline       | ☐ |
 | 6 | Neural Router       | ☐ |
 | 7 | Incremental retrain | ☐ |
@@ -32,12 +32,13 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 cpp/
   hylis/
     storage/    # record store + write-ahead log (header-only)
-    index/      # B+ tree, and later the learned index / HNSW
-  bindings/     # pybind11 modules -> hylis._storage, hylis._btree
+    index/      # B+ tree, flat vector index, RMI, per-column selection
+  bindings/     # pybind11 -> hylis._storage, _btree, _flat, _rmi
   tests/        # GoogleTest suites for the C++ core
 python/hylis/   # user-facing Python API; built extensions land here
   datasets.py   # data generators + loaders + the brute-force oracle
-scripts/        # fetch_data.py, benchmark drivers
+  learned.py    # numpy stage-1 models, for the RMI ablation only
+scripts/        # fetch_data.py, benchmarks, experiments, playgrounds
 tests/          # pytest, exercising the C++ core through the bindings
 data/           # downloaded corpora (git-ignored)
 ```
@@ -67,6 +68,51 @@ report timings from a Debug build.
 
 The compiled extensions are written straight into `python/hylis/`, so
 `pytest` works from a clean checkout with no install step.
+
+## The learned index
+
+`RMIndex` is a two-stage Recursive Model Index: for sorted keys the CDF *is*
+the map from key to position, so it is approximated by a model and corrected
+with a short local search.
+
+It is **exact, not approximate**. Each second-stage model records the worst
+prediction error it made at build time, so a lookup searches only a provably
+sufficient window. A bad model costs time; it can never cost correctness —
+`validate()` proves that by replaying every key.
+
+There is **no neural network and no training loop**. Both stages are
+closed-form least-squares fits; a million-key index builds in ~20 ms.
+
+```bash
+python scripts/bench_index.py            # B+ tree vs RMI, to 10M keys
+python scripts/experiment_curvature.py   # error vs model count, per distribution
+python scripts/experiment_stage1.py      # linear vs a from-scratch MLP stage 1
+```
+
+Three findings the scripts produce, all reproducible:
+
+**Curvature is cheap; discontinuity is not.** On `lognormal` (curved but
+continuous) mean error falls 926× as models are added, and keeps falling. On
+`clustered` (SOSD `fb`-shaped, cliffs rather than curves) it stops moving
+*entirely* past 4096 models — 16× more models change nothing, because 99% of
+them are routed no keys at all. That floor is set by gaps in the data, not by
+the model budget.
+
+**The RMI wins every read-only row.** 3–8× faster lookups than the B+ tree at
+every size and distribution tested, in less memory. The tree's real claim is
+mutability: the RMI has no `insert` at all and must be rebuilt wholesale.
+
+**A neural stage 1 helps only where routing is the bottleneck.** It is
+indistinguishable from a line on near-linear keys and hits the same floor on
+stepped ones, but on a skewed CDF it genuinely routes better (mean error
+2.8 → 1.2). It costs ~1000× the fit time to get there.
+
+`ColumnIndex` picks per column by **building every candidate and timing real
+lookups**, rather than guessing from an analytic cost model. `IndexCatalog`
+persists those decisions — plans, not fitted models, since models rebuild in
+milliseconds while producing a plan means re-measuring everything. Each plan
+carries a fingerprint of the data it was chosen for, so a stale plan is
+detected and re-tuned; it can only ever cost speed, never correctness.
 
 ## Trying the vector index
 

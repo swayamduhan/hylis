@@ -10,3 +10,13 @@ either without knowing which is underneath.
 """
 
 from hylis._btree import BPlusTree, CompareOp  # noqa: F401
+from hylis._rmi import (  # noqa: F401
+    ColumnIndex,
+    IndexCatalog,
+    IndexKind,
+    IndexPlan,
+    LinearModel,
+    RMIndex,
+    choose_index,
+    measure_plan,
+)

@@ -11,7 +11,17 @@ Architecture:
   hylis.index     (this file)     -> thin Python convenience wrappers
 """
 
-from hylis.index import BPlusTree, CompareOp  # noqa: F401
+from hylis.index import (  # noqa: F401
+    BPlusTree,
+    ColumnIndex,
+    CompareOp,
+    IndexCatalog,
+    IndexKind,
+    IndexPlan,
+    RMIndex,
+    choose_index,
+    measure_plan,
+)
 from hylis.storage import Record, RecordStore  # noqa: F401
 from hylis.vector import FlatIndex, Metric, Neighbor  # noqa: F401
 

@@ -53,20 +53,11 @@
 #include <utility>
 #include <vector>
 
-namespace hylis::index {
+// CompareOp is shared with the learned index — see the header for why the
+// two structures must present the same predicate interface.
+#include "index/compare_op.hpp"
 
-// Comparison operators supported by range_query. This enum and the
-// range_query signature are shared with the learned index: the query planner
-// picks an index per column at build time and then issues queries without
-// knowing which structure is underneath, so both must present the same
-// interface.
-enum class CompareOp {
-    Eq,  // == value
-    Lt,  // <  value
-    Le,  // <= value
-    Gt,  // >  value
-    Ge,  // >= value
-};
+namespace hylis::index {
 
 template <typename Key = std::int64_t, typename Value = std::int64_t>
 class BPlusTree {
@@ -205,6 +196,16 @@ public:
         count_ = 0;
     }
 
+    // Approximate resident footprint, in bytes: every node object plus the
+    // heap its vectors actually hold (capacity, not size — that is what is
+    // really occupied).
+    //
+    // Exists so a tree can be compared against a learned index on memory as
+    // well as speed, which is half the argument for learned indexes: a tree's
+    // internal nodes grow with n, while an RMI's models do not. Approximate
+    // because it cannot see the allocator's own per-block overhead.
+    std::size_t memory_bytes() const { return node_bytes(root_.get()); }
+
     // Full invariant check, for tests. Throws std::logic_error describing the
     // first violation found: key ordering within and across nodes, uniform
     // leaf depth, occupancy bounds, separator correctness, leaf-chain
@@ -292,6 +293,21 @@ private:
     std::size_t max_keys() const { return order_ - 1; }
     // Minimum keys for a *non-root* node: ceil(m/2) - 1.
     std::size_t min_keys() const { return (order_ + 1) / 2 - 1; }
+
+    static std::size_t node_bytes(const Node* n) {
+        if (n == nullptr) return 0;
+        std::size_t total = n->keys.capacity() * sizeof(Key);
+        if (n->is_leaf) {
+            const auto* leaf = static_cast<const LeafNode*>(n);
+            total += sizeof(LeafNode) + leaf->values.capacity() * sizeof(Value);
+            return total;
+        }
+        const auto* internal = static_cast<const InternalNode*>(n);
+        total += sizeof(InternalNode) +
+                 internal->children.capacity() * sizeof(std::unique_ptr<Node>);
+        for (const auto& child : internal->children) total += node_bytes(child.get());
+        return total;
+    }
 
     static std::size_t lower_bound_idx(const std::vector<Key>& ks, const Key& k) {
         return static_cast<std::size_t>(

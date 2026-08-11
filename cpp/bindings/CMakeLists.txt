@@ -51,3 +51,7 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/flat.cpp")
     hylis_add_binding(_flat flat.cpp)
 endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rmi.cpp")
+    hylis_add_binding(_rmi rmi.cpp)
+endif()

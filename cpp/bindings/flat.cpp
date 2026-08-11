@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "build_info.hpp"
 #include "index/flat.hpp"
 
 namespace py = pybind11;
@@ -48,23 +49,9 @@ const float* as_vector(const FloatArray& arr, std::size_t dim, const char* what)
 
 }  // namespace
 
-#ifndef HYLIS_BUILD_TYPE
-#define HYLIS_BUILD_TYPE "unknown"
-#endif
-
 PYBIND11_MODULE(_flat, m) {
     m.doc() = "hylis flat (brute-force) vector index core (C++)";
-
-    // How this extension was compiled. Timings taken from an unoptimised
-    // build are off by roughly 4x, which is more than most of the speedups
-    // this project sets out to measure — so benchmarks check these and say
-    // so rather than quietly reporting a meaningless number.
-    m.attr("__build_type__") = HYLIS_BUILD_TYPE;
-#ifdef NDEBUG
-    m.attr("__optimized__") = true;
-#else
-    m.attr("__optimized__") = false;
-#endif
+    hylis::bindings::attach_build_info(m);
 
     py::enum_<Metric>(m, "Metric", "Similarity measure used by a FlatIndex.")
         .value("L2", Metric::L2, "Euclidean distance; smaller is nearer")
