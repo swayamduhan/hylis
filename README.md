@@ -36,7 +36,10 @@ cpp/
   bindings/     # pybind11 modules -> hylis._storage, hylis._btree
   tests/        # GoogleTest suites for the C++ core
 python/hylis/   # user-facing Python API; built extensions land here
+  datasets.py   # data generators + loaders + the brute-force oracle
+scripts/        # fetch_data.py, benchmark drivers
 tests/          # pytest, exercising the C++ core through the bindings
+data/           # downloaded corpora (git-ignored)
 ```
 
 The C++ core is header-only and built with CMake; the ML layers (learned
@@ -58,3 +61,35 @@ pytest tests/               # Python bridge suites
 
 The compiled extensions are written straight into `python/hylis/`, so
 `pytest` works from a clean checkout with no install step.
+
+## Data
+
+`hylis.datasets` supplies three things, matching the three things the engine
+has to index:
+
+| Helper | For | Source |
+|---|---|---|
+| `synthetic_keys(dist, n, seed)` | B+ tree, learned index | generated offline |
+| `load_sift(variant)` | vector search, HNSW, router | downloaded |
+| `make_hybrid(vectors)` | query planner | vectors + generated predicates |
+
+Key distributions are generated rather than downloaded because for a learned
+index the *shape of the key CDF is the experiment*: `sequential_gaps` is
+near-linear and easy, `clustered` emulates the SOSD `fb` dataset and is the
+adversarial case where a B+ tree should win. `KeyDataset.linearity()` scores
+that shape, giving an axis to plot learned-index error against.
+
+Vectors come from SIFT because it ships **published ground-truth neighbours**,
+so recall can be checked against an oracle this project had no hand in
+producing. `compute_ground_truth` is verified against those published lists in
+`tests/test_sift.py`.
+
+```bash
+pip install -r requirements.txt
+python scripts/fetch_data.py --list
+python scripts/fetch_data.py siftsmall     # ~5 MB
+```
+
+Nothing is blocked on the download — everything except `load_sift` works
+offline, and the SIFT tests skip themselves when `data/` is empty. `data/` is
+git-ignored; benchmark corpora do not belong in a repository.

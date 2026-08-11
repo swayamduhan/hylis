@@ -6,3 +6,6 @@ python/hylis/*.so
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Benchmark corpora: large, immutable, re-downloadable (scripts/fetch_data.py)
+data/
