@@ -25,6 +25,12 @@ from hylis.index import (  # noqa: F401
     choose_index,
     measure_plan,
 )
+from hylis.query import (  # noqa: F401
+    HybridPlanner,
+    PlanKind,
+    Predicate,
+    QueryPlan,
+)
 from hylis.storage import Record, RecordStore  # noqa: F401
 from hylis.vector import (  # noqa: F401
     FlatIndex,

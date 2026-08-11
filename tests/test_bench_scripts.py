@@ -222,13 +222,37 @@ def test_discontinuity_experiment_settles_the_retracted_claim():
     )
 
 
+def test_planner_bench_reports_agreement_and_shortfalls():
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("bench_planner.py", ["--quick"])
+    assert proc.returncode == 0, out
+    assert "selectivity" in out and "regret" in out
+    assert "agreed with the measured winner" in out
+    # The post-filter shortfall column has to be there: it is the correctness
+    # cost of the plan a system without a planner uses, and the reason the
+    # module exists at all.
+    assert "short" in out
+
+
+def test_planner_calibration_beats_the_inherited_threshold():
+    """The 0.5 crossover came from a different corpus at a different ef.
+    Calibration measures it here instead -- and if that ever stops helping,
+    the whole measure-don't-model stance needs revisiting."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("bench_planner.py", ["--quick", "--calibrate"])
+    assert proc.returncode == 0, out
+    assert "calibrated: crossover measured at" in out
+
+
 def test_printed_output_is_console_safe():
     """Windows consoles are cp1252 by default, and an em-dash in a print()
     has already cost this project one UnicodeEncodeError. Cheaper to assert
     than to rediscover."""
     for script in ("bench_sosd.py", "experiment_merge_threshold.py",
                    "fetch_data.py", "experiment_router_scaling.py",
-                   "experiment_discontinuity.py"):
+                   "experiment_discontinuity.py", "bench_planner.py"):
         text = (SCRIPTS / script).read_text(encoding="utf-8")
         for number, line in enumerate(text.split("\n"), start=1):
             stripped = line.lstrip()
@@ -242,7 +266,7 @@ def test_scripts_report_their_own_usage():
                    "experiment_stage1.py", "bench_vector.py",
                    "experiment_merge_threshold.py", "bench_sosd.py",
                    "experiment_router_scaling.py",
-                   "experiment_discontinuity.py"):
+                   "experiment_discontinuity.py", "bench_planner.py"):
         proc, out = run(script, ["--help"])
         assert proc.returncode == 0, out
         assert "usage:" in out.lower()

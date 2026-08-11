@@ -21,4 +21,18 @@ enum class CompareOp {
     Ge,  // >= value
 };
 
+// The operator as it would appear in the query it came from. Used where a
+// predicate has to be shown to a person — a planner's explanation, a REPL
+// prompt — rather than evaluated.
+inline const char* symbol_of(CompareOp op) {
+    switch (op) {
+        case CompareOp::Eq: return "==";
+        case CompareOp::Lt: return "<";
+        case CompareOp::Le: return "<=";
+        case CompareOp::Gt: return ">";
+        case CompareOp::Ge: return ">=";
+    }
+    return "?";
+}
+
 }  // namespace hylis::index

@@ -64,6 +64,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hnsw.cpp")
     hylis_add_binding(_hnsw hnsw.cpp)
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/planner.cpp")
+    hylis_add_binding(_planner planner.cpp)
+endif()
+
 # Always built, even without hnswlib: the module then reports available=False
 # rather than making `import hylis._hnswlib` fail somewhere unhelpful.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hnswlib.cpp")

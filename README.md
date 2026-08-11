@@ -22,9 +22,58 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 | 5 | HNSW baseline       | ✅ |
 | 6 | Neural Router       | ✅ |
 | 7 | Incremental retrain | ✅ |
-| 8 | Query planner       | ☐ |
+| 8 | Query planner       | ✅ |
 | 9 | Benchmarks          | ☐ |
 | 10| Demo CLI            | ☐ |
+
+## What is left, and why in this order
+
+A review of the finished modules found one **structural** gap rather than a
+list of small ones: the three index families were each validated, and nothing
+composed them. `ColumnIndex.range_query` returns row ids; `search_filtered`
+takes row ids; no code path connected the two. Every caller of
+`search_filtered` built its `allowed` set by hand, and `make_hybrid` — written
+for exactly this path — was used by nothing but its own tests.
+
+That was module 8, and it is now built. The rest, ranked by value:
+
+**1. ~~The hybrid query planner (module 8).~~** ✅ Done — see below.
+
+**2. Wire `RecordStore` to `ColumnIndex`.** Module 1 is complete, tested, and
+connected to nothing — no index reads from the store it built.
+
+**3. Vector deletion.** Module 7 made the structured side fully mutable, but
+`HnswIndex` and `FlatIndex` stay append-only, so `DynamicRMIndex::erase` has no
+vector counterpart. The design is already owned: tombstone, filter at search,
+compact at rebuild — identical to `dynamic_rmi.hpp`.
+
+**4. The router during insertion.** The real research item, and the known
+limitation this README already states below: insertion still descends the
+hierarchy, which is why the layer-0-only build does not scale. Highest research
+value, highest risk.
+
+**5. Modules 9 and 10 are largely done** — nine benchmark scripts and two
+interactive REPLs exist. What remains is consolidation, not new work.
+
+### The framing these add up to
+
+Three levels of a database, each with a learned component measured against the
+non-learned baseline it replaces:
+
+| level | learned thing | baseline | measured result |
+|---|---|---|---|
+| data | key → position (RMI) | B+ tree | 3–8× faster, wins at every cliff density |
+| index | query → graph entry (neural router) | hierarchical descent | +31% at low ef, −6% at high |
+| query | predicate → plan (planner) | fixed-threshold rule | 100% plan agreement once calibrated |
+
+A *learned* cost model at the third level is the natural next step, and is
+deliberately not built yet: it needs the fixed-threshold planner as the
+baseline it has to beat, or there would be no way to show it was worth having.
+
+**Out of scope, deliberately:** concurrency. The HNSW visited set is
+epoch-stamped rather than cleared per query — clearing would make every search
+O(n) however few nodes it touched — which makes search non-thread-safe. Stated
+rather than papered over.
 
 ## Layout
 
@@ -211,6 +260,93 @@ milliseconds while producing a plan means re-measuring everything. Each plan
 carries a fingerprint of the data it was chosen for, so a stale plan is
 detected and re-tuned; it can only ever cost speed, never correctness.
 
+### A prediction this project got wrong
+
+`rmi.hpp` and `datasets.py` both used to claim that a **discontinuous** CDF is
+where a distribution-free B+ tree beats the learned index. The reasoning was
+that a model straddling a cliff eats the full error however large M gets —
+which is true, and the conclusion still does not follow.
+
+`scripts/experiment_discontinuity.py` holds n at 500,000 and sweeps the number
+of cliffs from 64 to 250,000, where half of all keys start a new cluster:
+
+```
+   cliffs    btree  best RMI  speedup   max_err  probes  winner
+       64    195.5      47.5    4.12x     3,299      64     RMI
+    1,000    150.0      34.7    4.32x     2,073      53     RMI
+   10,000    152.6      39.8    3.83x       229      52     RMI
+  100,000    146.6      29.3    5.00x        91      64     RMI
+  250,000    156.2      20.9    7.46x        67      64     RMI
+```
+
+**The B+ tree won 0 of 5 rows, and the RMI's margin grows with cliff density.**
+Two things the reasoning missed: only cliff-many models are hurt, so cost
+follows the typical model rather than the worst (`max_err` 3,299 beside 47
+ns/lookup is that gap); and a hurt model falls back to *binary search*, capped
+at O(log n), not to a scan.
+
+One precision, which a test caught after a first draft of the correction
+overstated it: a cliff genuinely does cost more **comparisons** — 64 against 4.
+What it does not cost is more **time**, because those 64 are a linear pass over
+one or two cache lines of a contiguous array while a B+ tree's 4 are
+pointer-chased and miss cache every time. *Counting comparisons flatters the
+tree.*
+
+So no shape of data hands the tree a lookup win. Its claim is mutability —
+which is what module 7 answers.
+
+## Incremental retraining
+
+`RMIndex` is build-only: every model and error bound derives from the whole key
+set at once, so one insert invalidates all of them. `DynamicRMIndex` pays that
+down without giving up exactness — an immutable RMI base, a **B+ tree delta
+buffer** (module 2 reused), and a tombstone bitmap.
+
+```bash
+python scripts/experiment_merge_threshold.py   # rho and tau_e, oracle-checked
+python scripts/bench_sosd.py --synthetic       # B+ tree vs RMI vs dynamic RMI
+```
+
+Following **DynaMind** (Cheng et al., *Knowledge-Based Systems* 348, 2026) for
+the incremental-learning / machine-unlearning formulation, with two deviations,
+both consequences of this index being *exact* where theirs need not be:
+
+**Moments accumulate over the shifted coordinate** `x = key − origin`, not the
+raw key. The paper's `S_kk = Σk²` reaches ~10³¹ at our key sizes, which a
+double holds to a few figures before the subtraction that follows cancels the
+rest.
+
+**Unlearning updates the statistics only, never the installed model.** Moving
+the model would invalidate the error bounds measured against it, and a lookup
+could then miss a key that exists.
+
+**Deletions are tombstoned, never compacted**, and that is load-bearing twice:
+base positions never shift, so every surviving key's bound stays valid, and
+withdrawing a key from its model's moments becomes exact and O(1).
+
+Two findings worth stating:
+
+**The paper's Cook's-distance trigger buys nothing here.** Every finite `τ_e`
+from 0.1 to 100 gave identical merge counts and mean error, at ~20× the cost of
+no trigger at all. The cause is architectural — inserts land in the delta
+buffer, so base models stay exactly right until the merge and there is no drift
+to catch. (Separately, the score is not scale-free in segment length: median
+0.58 at 1562 keys/model against 6.5e6 at 6, so `τ_e = 1.0` could not have
+transferred regardless.) The default is therefore the trigger **off**.
+
+**The incremental merge's saving is real but conditional.** A model that saw no
+write needs only its intercept shifted, which provably leaves its residuals —
+and so its bounds — untouched. An append leaves 255 of 256 models needing only
+that; a *scattered* batch disturbs 192 of them and rescans 75% of the keys.
+Both halves are asserted in tests, so the saving is never quoted as
+unconditional.
+
+The router goes stale the same way and is repaired in two tiers — see
+`router_health()` / `repair_router_medoids()`. Drift is measured against the
+**medoids** rather than centroids, because the medoid is the node the beam
+actually starts from, and because the router format deliberately does not
+persist centroids.
+
 ## Vector search: exact and approximate
 
 Two indexes over the same vectors, both kept in the final build.
@@ -265,6 +401,82 @@ expensive — at 0.1% selectivity it visits all 10,004 nodes and takes 1502 µs
 against brute force's 3 µs. Below ~50% selectivity the exhaustive scan wins
 outright. That crossover is precisely what the query planner has to predict.
 
+## The hybrid query planner
+
+The module the project is named for: one query, two indexes.
+
+```sql
+SELECT id FROM t
+WHERE  price < $t                     -- structured predicate
+ORDER BY distance(embedding, $q)      -- vector similarity
+LIMIT  10
+```
+
+```bash
+python scripts/bench_planner.py --calibrate
+```
+
+Everything needed already existed — `ColumnIndex.range_query` returns row ids,
+and both vector indexes take row ids as a filter. `HybridPlanner` is that join
+plus the decision of how to execute it, across three plans:
+
+| plan | cost | wins when |
+|---|---|---|
+| `PreFilter` | `O(\|allowed\|)`, exact | tight predicates |
+| `FilteredGraph` | grows as the predicate tightens | loose predicates |
+| `PostFilter` | search unfiltered, then drop non-matches | **never — it is the trap** |
+
+**`PostFilter` is implemented because it is what a system without a planner
+does**, and measuring it is what makes choosing against it a result rather than
+an assumption. At 20k×32-d, k=10, across 50 queries (500 rows wanted):
+
+```
+selectivity   0.1%   0.5%   1.0%   5.0%  10.0%  25%+
+rows missing   498    484    463    262     75     0
+```
+
+At 0.1% selectivity it returns **2 rows out of 500**. Not slow — *wrong*, and
+silently so.
+
+**Selectivity is executed, not estimated.** The planner runs the predicate
+through `ColumnIndex` first, so it knows `|allowed|` exactly. A real optimiser
+estimates from histograms because it must plan before executing; here the
+structured lookup is nanoseconds and the row ids are work the query needs
+anyway, so executing the predicate *is* the estimate. The cost — a predicate
+matching nearly everything is paid for in full before the planner can discover
+it — is stated rather than hidden.
+
+**The 50% crossover did not transfer, and calibration fixes it.** The threshold
+was inherited from module 5's SIFT10K measurement; on 20,000 32-d vectors at
+ef=64 it sits nearer 20%:
+
+| | agreement with the measured winner | mean regret | worst regret |
+|---|---|---|---|
+| inherited 50% | 8/10 | 1.24× | **3.25×** |
+| `calibrate()` → 20.8% | **10/10** | **1.00×** | **1.00×** |
+
+The crossover is not a constant of the algorithm — it moves with n,
+dimensionality, ef and cache speed. `calibrate()` times both plans on real
+queries and adopts the measured midpoint, which is the same answer
+`choose_index()` gives one level down.
+
+*Regret* is reported next to agreement deliberately: a planner wrong 20% of the
+time but only ever by 3% is better than one wrong 5% of the time and
+catastrophically so.
+
+### A bug every test missed and the benchmark caught
+
+`matching_rows` returns row ids ordered by the column's **key** — the attribute
+— not by row id. `PostFilter` tested membership with a binary search, which is
+only valid on a list sorted by row id.
+
+Every C++ fixture happened to use a column whose values were already ascending,
+so the search always succeeded and the bug was invisible to the entire suite.
+The first real attribute column exposed it immediately: ~2 of 500 rows returned
+*at every selectivity, including 100%*. **Every test was correct; they all
+shared one accidental property.** Now pinned by a test that first asserts its
+own fixture lacks that property.
+
 ## Trying the B+ tree
 
 ```bash
@@ -292,8 +504,12 @@ has to index:
 Key distributions are generated rather than downloaded because for a learned
 index the *shape of the key CDF is the experiment*: `sequential_gaps` is
 near-linear and easy, `clustered` emulates the SOSD `fb` dataset and is the
-adversarial case where a B+ tree should win. `KeyDataset.linearity()` scores
-that shape, giving an axis to plot learned-index error against.
+hardest shape for a piecewise-linear fit. `KeyDataset.position_error()` scores
+that shape in records, giving an axis to plot learned-index error against.
+
+> This paragraph used to end "…and is the adversarial case where a B+ tree
+> should win." **That was measured and retracted** — see *A prediction this
+> project got wrong* below.
 
 Vectors come from SIFT because it ships **published ground-truth neighbours**,
 so recall can be checked against an oracle this project had no hand in
