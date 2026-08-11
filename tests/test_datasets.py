@@ -49,21 +49,39 @@ def test_zero_or_negative_n_rejected():
         ds.synthetic_keys("uniform", n=0)
 
 
-def test_linearity_ranks_distributions_as_expected():
+def test_position_error_ranks_distributions_as_expected():
     """The whole point of having four shapes: they must actually differ.
 
-    A learned index interpolates the key CDF, so if these all scored the same
-    there would be no experiment to run. sequential_gaps is near-linear;
-    clustered and lognormal are the ones an RMI should struggle with.
+    A learned index interpolates the key CDF, so if these all cost the same
+    there would be no experiment to run. The easy shapes must stay within a
+    handful of records of a straight line, and the hard ones must be
+    decisively worse -- otherwise the 'B+ tree wins on clustered data' result
+    has no data to appear in.
     """
-    scores = {
-        dist: ds.synthetic_keys(dist, n=20_000, seed=3).linearity()
+    errors = {
+        dist: ds.synthetic_keys(dist, n=20_000, seed=3).position_error()
         for dist in ALL_DISTRIBUTIONS
     }
-    assert scores["sequential_gaps"] > 0.99
-    assert scores["uniform"] > 0.99
-    assert scores["lognormal"] < scores["uniform"]
-    assert scores["clustered"] < scores["sequential_gaps"]
+    easy = max(errors["sequential_gaps"][1], errors["uniform"][1])
+    assert easy < 100, "near-linear CDFs should need only a tiny search window"
+    assert errors["lognormal"][1] > 10 * easy
+    assert errors["clustered"][1] > 10 * easy
+    for dist, (mean_err, max_err) in errors.items():
+        assert 0.0 <= mean_err <= max_err, dist
+
+
+def test_r_squared_is_insensitive_where_position_error_is_not():
+    """Pins the reason position_error exists rather than plain R^2.
+
+    Clustered keys look almost perfectly linear to R^2 while costing a
+    learned index far more than uniform keys do. If a future change made R^2
+    adequate this test would fail, which is the point.
+    """
+    clustered = ds.synthetic_keys("clustered", n=20_000, seed=3)
+    uniform = ds.synthetic_keys("uniform", n=20_000, seed=3)
+
+    assert clustered.linearity() > 0.98, "R^2 barely notices the clustering"
+    assert clustered.position_error()[1] > 5 * uniform.position_error()[1]
 
 
 def test_keys_load_into_the_btree():
