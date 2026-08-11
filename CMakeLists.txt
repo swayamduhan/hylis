@@ -27,6 +27,19 @@ project(hylis
 option(HYLIS_BUILD_TESTS  "Build the GoogleTest unit tests"         ON)
 option(HYLIS_BUILD_PYTHON "Build the pybind11 Python bindings"      ON)
 
+# --------------------------------------------------------- build type
+# A bare `cmake -B build` leaves CMAKE_BUILD_TYPE empty on single-config
+# generators, which means no optimisation flag at all — not even -O1. That is
+# a quiet trap for a project whose deliverable is a set of benchmark numbers:
+# an unoptimised scan measures roughly 4x slower than a real one, so every
+# comparison drawn from it is wrong while looking perfectly plausible.
+# Default to Release; `--preset default` still asks for Debug explicitly.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type (Debug/Release/RelWithDebInfo/MinSizeRel)" FORCE)
+    message(STATUS "hylis: CMAKE_BUILD_TYPE was unset; defaulting to Release")
+endif()
+
 # ----------------------------------------------------------- C++ standard
 # We require C++17. `req_on_std` semantics: CMake sets the standard as a hard
 # requirement, so consumers can't accidentally downgrade it.

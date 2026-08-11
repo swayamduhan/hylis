@@ -24,6 +24,10 @@ set(HYLIS_PY_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/python/hylis")
 function(hylis_add_binding name source)
     pybind11_add_module(${name} ${source})
     target_link_libraries(${name} PRIVATE hylis_core)
+    # Lets Python see how the extension was compiled, so a benchmark can
+    # refuse to report timings from an unoptimised build.
+    target_compile_definitions(${name} PRIVATE
+        HYLIS_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
     # Multi-config generators (MSVC) append a per-config subdir unless the
     # per-config property is set too, so set both.
     set_target_properties(${name} PROPERTIES
@@ -42,4 +46,8 @@ endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/btree.cpp")
     hylis_add_binding(_btree btree.cpp)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/flat.cpp")
+    hylis_add_binding(_flat flat.cpp)
 endif()

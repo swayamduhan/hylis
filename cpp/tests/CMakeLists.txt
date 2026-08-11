@@ -31,10 +31,23 @@ function(hylis_add_test name)
     # their own per-test subdirs under build/test-tmp.
     target_compile_definitions(${name} PRIVATE
         HYLIS_TEST_TMP="${CMAKE_BINARY_DIR}/test-tmp")
-    gtest_discover_tests(${name})
+    # DISCOVERY_MODE PRE_TEST, not the POST_BUILD default.
+    #
+    # In POST_BUILD mode each target's test list is enumerated as a build
+    # step, into a file named with a hash of the target's properties. Those
+    # hashes all came out as e3b0c442 here — the SHA1 of the empty string —
+    # so with Ninja building the test binaries in parallel the discovery
+    # steps raced and clobbered one another. The observed result was
+    # test_flat's registration being filled with test_storage's test names
+    # pointed at test_flat.exe: 28 real tests silently not running, and 12
+    # phantom ones "passing" because --gtest_filter matched nothing and
+    # gtest exits 0. A green suite that tests nothing is the worst possible
+    # failure mode, so discovery is deferred to ctest run time instead.
+    gtest_discover_tests(${name} DISCOVERY_MODE PRE_TEST)
 endfunction()
 
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/test-tmp)
 
 hylis_add_test(test_storage)
 hylis_add_test(test_btree)
+hylis_add_test(test_flat)

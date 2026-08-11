@@ -17,7 +17,7 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 |---|---------------------|--------|
 | 1 | Storage + WAL       | ✅ |
 | 2 | B+ Tree             | ✅ |
-| 3 | Brute-force vector  | ☐ |
+| 3 | Brute-force vector  | ✅ |
 | 4 | Learned Index (RMI) | ☐ |
 | 5 | HNSW baseline       | ☐ |
 | 6 | Neural Router       | ☐ |
@@ -52,15 +52,39 @@ Requires a C++17 compiler, CMake 3.18+, Ninja and Python 3.8+ on `PATH`
 (pybind11 and GoogleTest are fetched automatically).
 
 ```bash
-cmake --preset default      # or: cmake -B build -G Ninja
+cmake --preset release      # use this for anything you intend to time
 cmake --build build
 
 ctest --test-dir build      # C++ suites
 pytest tests/               # Python bridge suites
 ```
 
+`--preset default` is a Debug build; a bare `cmake -B build` now defaults to
+Release, because an unoptimised scan measures ~5.7x slower than a real one
+and would silently corrupt every benchmark drawn from it. The extensions
+expose `hylis._flat.__optimized__` so the benchmark scripts can refuse to
+report timings from a Debug build.
+
 The compiled extensions are written straight into `python/hylis/`, so
 `pytest` works from a clean checkout with no install step.
+
+## Trying the vector index
+
+```bash
+python scripts/try_vectors.py --demo       # scripted walkthrough
+python scripts/try_vectors.py --sift       # real SIFT10K
+python scripts/try_vectors.py --random 5000x64 --metric cosine
+python scripts/try_vectors.py --npy mine.npy
+```
+
+`check` diffs every result against the numpy oracle, `truth` against SIFT's
+published neighbour lists, and `filter <selectivity>` runs the same query
+both ways — pre-filter and post-filter — reporting how many vectors each
+plan had to touch. That gap is what the query planner exists to exploit.
+
+`FlatIndex` stays in the final build alongside HNSW rather than being
+replaced by it: it is the exactness oracle, the baseline, and genuinely the
+cheaper plan once a selective predicate has cut the candidate set down.
 
 ## Trying the B+ tree
 

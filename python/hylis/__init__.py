@@ -13,5 +13,6 @@ Architecture:
 
 from hylis.index import BPlusTree, CompareOp  # noqa: F401
 from hylis.storage import Record, RecordStore  # noqa: F401
+from hylis.vector import FlatIndex, Metric, Neighbor  # noqa: F401
 
 __version__ = "0.1.0"
