@@ -248,7 +248,7 @@ def main(argv=None) -> int:
         print("  graded on its own answer and beating it is not possible. Use")
         print("  exact labels (the default where affordable) for a fair test.")
 
-    export_router(model, km.medoids, out_path)
+    export_router(model, km.medoids, out_path, vectors=corpus.base)
     print(f"\n  weights written to {out_path}")
     print(f"  load them with: NeuralRouter.load({out_path!r})")
     return 0

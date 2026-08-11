@@ -170,6 +170,40 @@ public:
         return {};
     }
 
+    // range_query(), carrying the keys. Same reason as range_items().
+    std::vector<std::pair<Key, Value>> range_query_items(CompareOp op,
+                                                         const Key& value) const {
+        std::vector<std::pair<Key, Value>> out;
+        switch (op) {
+            case CompareOp::Eq:
+                if (const Value* v = find(value)) out.emplace_back(value, *v);
+                return out;
+            case CompareOp::Lt: return collect_until_items(value, /*inclusive=*/false);
+            case CompareOp::Le: return collect_until_items(value, /*inclusive=*/true);
+            case CompareOp::Gt: return collect_from_items(value, /*inclusive=*/false);
+            case CompareOp::Ge: return collect_from_items(value, /*inclusive=*/true);
+        }
+        return out;
+    }
+
+    // (key, value) pairs in [lo, hi], ascending. Same walk as range(), but
+    // carrying the keys — which a caller merging this against another sorted
+    // stream needs, since it has to compare keys to interleave them.
+    std::vector<std::pair<Key, Value>> range_items(const Key& lo, const Key& hi) const {
+        std::vector<std::pair<Key, Value>> out;
+        if (hi < lo) return out;
+
+        const LeafNode* leaf = descend(lo);
+        std::size_t i = lower_bound_idx(leaf->keys, lo);
+        for (; leaf != nullptr; leaf = leaf->next, i = 0) {
+            for (; i < leaf->keys.size(); ++i) {
+                if (hi < leaf->keys[i]) return out;
+                out.emplace_back(leaf->keys[i], leaf->values[i]);
+            }
+        }
+        return out;
+    }
+
     // All (key, value) pairs in ascending key order.
     std::vector<std::pair<Key, Value>> items() const {
         std::vector<std::pair<Key, Value>> out;
@@ -573,6 +607,36 @@ private:
             for (; i < leaf->keys.size(); ++i) {
                 if (!inclusive && leaf->keys[i] == bound) continue;
                 out.push_back(leaf->values[i]);
+            }
+        }
+        return out;
+    }
+
+    // The two above, carrying keys. Kept as separate walks rather than one
+    // templated over the element type: two short loops read better than the
+    // machinery that would be needed to share them.
+    std::vector<std::pair<Key, Value>> collect_until_items(const Key& bound,
+                                                           bool inclusive) const {
+        std::vector<std::pair<Key, Value>> out;
+        for (const LeafNode* leaf = first_leaf(); leaf; leaf = leaf->next) {
+            for (std::size_t i = 0; i < leaf->keys.size(); ++i) {
+                const Key& k = leaf->keys[i];
+                if (bound < k || (!inclusive && k == bound)) return out;
+                out.emplace_back(k, leaf->values[i]);
+            }
+        }
+        return out;
+    }
+
+    std::vector<std::pair<Key, Value>> collect_from_items(const Key& bound,
+                                                          bool inclusive) const {
+        std::vector<std::pair<Key, Value>> out;
+        const LeafNode* leaf = descend(bound);
+        std::size_t i = lower_bound_idx(leaf->keys, bound);
+        for (; leaf != nullptr; leaf = leaf->next, i = 0) {
+            for (; i < leaf->keys.size(); ++i) {
+                if (!inclusive && leaf->keys[i] == bound) continue;
+                out.emplace_back(leaf->keys[i], leaf->values[i]);
             }
         }
         return out;

@@ -378,3 +378,126 @@ def test_flat_only_saves_graph_memory(corpus):
     full.add_batch(corpus.base)
     flat_graph.add_batch(corpus.base)
     assert flat_graph.stats().graph_bytes < full.stats().graph_bytes
+
+
+# --------------------------------------------------------- router staleness
+
+
+def _drift_setup(n=2500, dim=12, clusters=24, seed=0, shift=6.0):
+    """A router fitted to half a corpus, then shown a displaced second half."""
+    v = ds.random_vectors(n=n * 2, dim=dim, n_queries=50, seed=seed,
+                          n_clusters=clusters * 2)
+    first, second = v.base[:n], (v.base[n:] + shift).astype(np.float32)
+
+    km = kmeans(first, n_clusters=clusters, seed=seed)
+    ts = build_training_set(first, km.assignment, n_samples=n * 2, seed=seed)
+    model = RouterMLP(dim=dim, clusters=km.centroids.shape[0], hidden=32, seed=seed)
+    model.fit(ts.x_train, ts.y_train, epochs=12)
+    blob = router_json(model, km.medoids, vectors=first)
+
+    graph = HnswIndex(dim, Metric.L2, M=8, ef_construction=100)
+    graph.add_batch(first)
+    graph.set_router(NeuralRouter.from_json(blob))
+    return graph, second
+
+
+def test_the_baseline_is_recorded_at_training_time():
+    graph, _ = _drift_setup()
+    router = graph.router()
+    assert router.has_baseline
+    assert router.baseline_entry_distance > 0.0
+    assert router.trained_on == 2500
+
+
+def test_a_router_without_a_baseline_reports_that_rather_than_guessing():
+    """Routers written before staleness tracking must still load, and must not
+    invent a reference point that would look like health."""
+    v = ds.random_vectors(n=800, dim=8, n_queries=10, seed=1, n_clusters=8)
+    km = kmeans(v.base, n_clusters=8, seed=1)
+    ts = build_training_set(v.base, km.assignment, n_samples=1600, seed=1)
+    model = RouterMLP(dim=8, clusters=km.centroids.shape[0], hidden=16, seed=1)
+    model.fit(ts.x_train, ts.y_train, epochs=5)
+
+    router = NeuralRouter.from_json(router_json(model, km.medoids))  # no vectors
+    assert not router.has_baseline
+    assert router.baseline_entry_distance == 0.0
+
+    graph = HnswIndex(8, Metric.L2, M=8, ef_construction=50)
+    graph.add_batch(v.base)
+    graph.set_router(router)
+    health = graph.router_health()
+    assert not health.comparable
+    assert health.drift_ratio == 1.0
+    assert health.mean_entry_distance > 0.0, "the raw figure is still available"
+
+
+def test_a_fresh_router_reports_no_drift():
+    graph, _ = _drift_setup()
+    health = graph.router_health()
+    assert health.comparable
+    assert 0.7 < health.drift_ratio < 1.4, f"drift {health.drift_ratio} on an untouched index"
+
+
+def test_growth_into_new_territory_is_detected():
+    graph, second = _drift_setup()
+    before = graph.router_health().drift_ratio
+    graph.add_batch(second)
+
+    health = graph.router_health()
+    assert health.drift_ratio > before * 2, (
+        "the corpus doubled into a region the router never saw and the drift "
+        "statistic did not notice"
+    )
+    assert abs(health.growth_ratio - 2.0) < 0.01
+    assert health.current_size == 5000
+
+
+def test_repair_recovers_most_of_the_drift_without_retraining():
+    graph, second = _drift_setup()
+    graph.add_batch(second)
+    drifted = graph.router_health().mean_entry_distance
+
+    moved = graph.repair_router_medoids()
+    repaired = graph.router_health().mean_entry_distance
+
+    assert moved > 0
+    assert repaired < drifted
+
+
+def test_repair_does_not_claim_to_replace_a_retrain():
+    """The honest boundary between the two tiers. Repair moves the nodes the
+    classifier lands on; it cannot fix the classifier, so a corpus grown into
+    unmodelled regions does not come all the way back."""
+    graph, second = _drift_setup(shift=10.0)
+    baseline = graph.router_health().mean_entry_distance
+    graph.add_batch(second)
+    graph.repair_router_medoids()
+    assert graph.router_health().mean_entry_distance > baseline
+
+
+def test_rebaseline_accepts_the_current_state():
+    graph, second = _drift_setup()
+    graph.add_batch(second)
+    graph.repair_router_medoids()
+    graph.rebaseline_router()
+
+    health = graph.router_health()
+    assert 0.7 < health.drift_ratio < 1.4
+    assert health.trained_on == 5000
+
+
+def test_repair_never_breaks_the_search():
+    """The standing property from module 6 -- correctness is independent of
+    routing quality -- has to survive entry points being moved."""
+    graph, second = _drift_setup()
+    graph.add_batch(second)
+    graph.repair_router_medoids()
+
+    v = ds.random_vectors(n=100, dim=12, n_queries=20, seed=99, n_clusters=10)
+    for query in v.queries:
+        found = graph.search(query, k=10, ef=64, use_router=True)
+        ids = [n.id for n in found]
+        assert len(ids) == len(set(ids)), "duplicate ids after repair"
+        assert all(0 <= i < 5000 for i in ids)
+        scores = [n.score for n in found]
+        assert scores == sorted(scores), "results unsorted after repair"

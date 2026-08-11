@@ -22,6 +22,7 @@
 
 #include "build_info.hpp"
 #include "index/column_index.hpp"
+#include "index/dynamic_rmi.hpp"
 #include "index/index_catalog.hpp"
 #include "index/rmi.hpp"
 
@@ -33,10 +34,12 @@ using hylis::index::ColumnValue;
 using hylis::index::CompareOp;
 using hylis::index::IndexCatalog;
 using hylis::index::IndexKind;
+using hylis::index::Workload;
 using hylis::index::IndexPlan;
 using hylis::index::LinearModel;
 
 using Learned = hylis::index::RMIndex<std::int64_t, std::int64_t>;
+using Dynamic = hylis::index::DynamicRMIndex<std::int64_t, std::int64_t>;
 
 PYBIND11_MODULE(_rmi, m) {
     m.doc() = "hylis learned index core (C++): two-stage RMI, per-column selection";
@@ -137,11 +140,113 @@ PYBIND11_MODULE(_rmi, m) {
                    ", max_error=" + std::to_string(self.stats().max_error) + ")";
         });
 
+    // ------------------------------------------------------- DynamicRMIndex
+
+    py::class_<Dynamic::Config>(m, "DynamicConfig",
+        "Tuning for a writable learned index.\n\n"
+        "score_threshold defaults to infinity — the Cook's distance trigger\n"
+        "off — and that is a measured default, not a placeholder. See\n"
+        "scripts/experiment_merge_threshold.py.")
+        .def(py::init<>())
+        .def_readwrite("second_stage_size", &Dynamic::Config::second_stage_size)
+        .def_readwrite("search_threshold", &Dynamic::Config::search_threshold)
+        .def_readwrite("delta_order", &Dynamic::Config::delta_order)
+        .def_readwrite("merge_ratio", &Dynamic::Config::merge_ratio,
+                       "Merge once pending changes reach this fraction of the base.")
+        .def_readwrite("score_threshold", &Dynamic::Config::score_threshold,
+                       "Merge once a disturbed model's Cook's distance passes\n"
+                       "this. Infinity disables it.")
+        .def_readwrite("score_check_interval", &Dynamic::Config::score_check_interval)
+        .def_readwrite("rebuild_error_ratio", &Dynamic::Config::rebuild_error_ratio,
+                       "Refit stage 1 when mean error passes this multiple of\n"
+                       "its value at the last full build.");
+
+    py::class_<Dynamic::Stats>(m, "DynamicStats",
+        "What the index holds and what maintaining it has cost.")
+        .def_readonly("size", &Dynamic::Stats::size)
+        .def_readonly("base_size", &Dynamic::Stats::base_size)
+        .def_readonly("delta_size", &Dynamic::Stats::delta_size)
+        .def_readonly("tombstones", &Dynamic::Stats::tombstones)
+        .def_readonly("merges", &Dynamic::Stats::merges)
+        .def_readonly("full_rebuilds", &Dynamic::Stats::full_rebuilds)
+        .def_readonly("models_shifted", &Dynamic::Stats::models_shifted,
+                      "Cumulative models updated in O(1) by an intercept shift.")
+        .def_readonly("models_refitted", &Dynamic::Stats::models_refitted,
+                      "Cumulative models that had to be refitted over their\n"
+                      "whole segment. The ratio against models_shifted is how\n"
+                      "localised the write pattern was.")
+        .def_readonly("keys_rescanned", &Dynamic::Stats::keys_rescanned)
+        .def_readonly("last_merge_seconds", &Dynamic::Stats::last_merge_seconds)
+        .def_readonly("total_merge_seconds", &Dynamic::Stats::total_merge_seconds)
+        .def_readonly("index_bytes", &Dynamic::Stats::index_bytes)
+        .def_readonly("mean_error", &Dynamic::Stats::mean_error)
+        .def_readonly("baseline_mean_error", &Dynamic::Stats::baseline_mean_error)
+        .def_readonly("max_error", &Dynamic::Stats::max_error)
+        .def("__repr__", [](const Dynamic::Stats& s) {
+            return "DynamicStats(size=" + std::to_string(s.size) +
+                   ", base=" + std::to_string(s.base_size) +
+                   ", delta=" + std::to_string(s.delta_size) +
+                   ", tombstones=" + std::to_string(s.tombstones) +
+                   ", merges=" + std::to_string(s.merges) + ")";
+        });
+
+    py::class_<Dynamic>(m, "DynamicRMIndex",
+        "A learned index you can write to.\n\n"
+        "An immutable RMI over an out-of-place delta buffer, with deletions\n"
+        "tombstoned rather than compacted. Tombstoning is what keeps the base\n"
+        "positions fixed, which is what keeps every surviving key's error\n"
+        "bound valid and makes withdrawing a key from its model's statistics\n"
+        "exact and O(1) — machine unlearning in the DynaMind sense.\n\n"
+        "Same find/range/range_query contract as RMIndex and BPlusTree, so a\n"
+        "query planner can hold any of the three. Reads pay a delta probe and\n"
+        "a tombstone check that a static RMIndex does not: this is slower\n"
+        "read-only, and that is the price of being writable.")
+        .def(py::init<Dynamic::Config>(), py::arg("config") = Dynamic::Config{})
+        .def("build", &Dynamic::build, py::arg("keys"), py::arg("values"),
+             "Fit from a sorted, unique key set. Keys must be strictly\n"
+             "ascending; raises ValueError otherwise.")
+        .def("insert", &Dynamic::insert, py::arg("key"), py::arg("value"),
+             "False if the key is already present.")
+        .def("erase", &Dynamic::erase, py::arg("key"),
+             "False if the key was not present.")
+        .def("find", [](const Dynamic& self, std::int64_t key) -> py::object {
+            const std::int64_t* v = self.find(key);
+            return v ? py::cast(*v) : py::none();
+        }, py::arg("key"), "Look up a key. Returns the value or None.")
+        .def("contains", &Dynamic::contains, py::arg("key"))
+        .def("range", &Dynamic::range, py::arg("lo"), py::arg("hi"))
+        .def("range_query", &Dynamic::range_query, py::arg("op"), py::arg("value"))
+        .def("merge", &Dynamic::merge,
+             "Fold the delta buffer and tombstones back into the base now.")
+        .def("merge_due", &Dynamic::merge_due,
+             "Whether a merge would happen if the triggers were checked now.")
+        .def("score", &Dynamic::score,
+             "Worst Cook's distance over the models disturbed since the last\n"
+             "merge: how far the deletions have pulled them from their data.")
+        .def("stats", &Dynamic::stats)
+        .def("validate", &Dynamic::validate,
+             "Check every invariant, including that the underlying RMI is\n"
+             "still exact — every stored key inside its predicted window.\n"
+             "Raises RuntimeError otherwise.")
+        .def("__len__", &Dynamic::size)
+        .def("__contains__", &Dynamic::contains)
+        .def("__repr__", [](const Dynamic& self) {
+            const auto s = self.stats();
+            return "DynamicRMIndex(size=" + std::to_string(s.size) +
+                   ", base=" + std::to_string(s.base_size) +
+                   ", delta=" + std::to_string(s.delta_size) +
+                   ", tombstones=" + std::to_string(s.tombstones) + ")";
+        });
+
     // ----------------------------------------------------------- selection
 
     py::enum_<IndexKind>(m, "IndexKind", "Which structure a column was given.")
         .value("BPlusTree", IndexKind::BPlusTree)
-        .value("RMI", IndexKind::RMI);
+        .value("RMI", IndexKind::RMI,
+               "Build-only. A legal answer for a read-only column and no other.")
+        .value("DynamicRMI", IndexKind::DynamicRMI,
+               "The learned index made writable: an immutable RMI over a delta\n"
+               "buffer, with deletions tombstoned.");
 
     py::class_<IndexPlan>(m, "IndexPlan",
         "A per-column index decision, and the measurements behind it.\n\n"
@@ -152,6 +257,15 @@ PYBIND11_MODULE(_rmi, m) {
         .def_readwrite("rmi_models", &IndexPlan::rmi_models)
         .def_readwrite("search_threshold", &IndexPlan::search_threshold)
         .def_readwrite("btree_order", &IndexPlan::btree_order)
+        .def_readwrite("merge_ratio", &IndexPlan::merge_ratio,
+                       "DynamicRMI only: when to fold the delta buffer back in.")
+        .def_readwrite("write_fraction", &IndexPlan::write_fraction,
+                       "The write rate this plan was chosen for. A plan picked\n"
+                       "for a read-only column is not evidence about one that\n"
+                       "has started taking writes, whatever the keys look like.")
+        .def_readwrite("ns_per_write", &IndexPlan::ns_per_write,
+                       "Measured on a 50/50 insert/erase stream; 0 when the\n"
+                       "column was chosen read-only.")
         .def_readwrite("ns_per_lookup", &IndexPlan::ns_per_lookup,
                        "Measured on this machine at selection time, in C++ —\n"
                        "not timed across the Python bridge.")
@@ -171,17 +285,36 @@ PYBIND11_MODULE(_rmi, m) {
                    ", index_bytes=" + std::to_string(p.index_bytes) + ")";
         });
 
-    m.def("choose_index", &hylis::index::choose_index,
+    m.def("choose_index", [](const std::vector<ColumnKey>& keys,
+                             const std::vector<ColumnValue>& values,
+                             std::size_t size_budget, double write_fraction) {
+              Workload workload;
+              workload.write_fraction = write_fraction;
+              return hylis::index::choose_index(keys, values, size_budget, workload);
+          },
           py::arg("keys"), py::arg("values"),
           py::arg("size_budget") = std::numeric_limits<std::size_t>::max(),
+          py::arg("write_fraction") = 0.0,
           "Build every candidate structure, time real lookups on each, and\n"
           "return the plan for the fastest that fits the budget.\n\n"
           "Deliberately empirical: an analytic cost model over assumed\n"
           "cache-miss constants would need retuning per machine and could not\n"
-          "be checked. Costs seconds once per column.");
+          "be checked. Costs seconds once per column.\n\n"
+          "write_fraction is not a refinement. On lookups alone the static\n"
+          "RMI wins nearly everything, and it is build-only -- so without\n"
+          "knowing the write rate this would hand an immutable structure to\n"
+          "a column that is about to be written to. Above zero, only\n"
+          "writable candidates are considered and writes are timed too.");
 
-    m.def("measure_plan", &hylis::index::measure_plan,
+    m.def("measure_plan", [](const std::vector<ColumnKey>& keys,
+                             const std::vector<ColumnValue>& values,
+                             const IndexPlan& plan, double write_fraction) {
+              Workload workload;
+              workload.write_fraction = write_fraction;
+              return hylis::index::measure_plan(keys, values, plan, workload);
+          },
           py::arg("keys"), py::arg("values"), py::arg("plan"),
+          py::arg("write_fraction") = 0.0,
           "Build one specific plan and time it, returning the plan with its\n"
           "measured fields filled in. The honest way to benchmark a single\n"
           "structure from Python.");
@@ -191,9 +324,16 @@ PYBIND11_MODULE(_rmi, m) {
         "Presents the same find/range_query pair whether a B+ tree or a\n"
         "learned index is inside, so a query planner can ask for rows\n"
         "matching a predicate without learning what answered.")
-        .def_static("build", &ColumnIndex::build,
+        .def_static("build", [](const std::vector<ColumnKey>& keys,
+                                const std::vector<ColumnValue>& values,
+                                std::size_t size_budget, double write_fraction) {
+                        Workload workload;
+                        workload.write_fraction = write_fraction;
+                        return ColumnIndex::build(keys, values, size_budget, workload);
+                    },
                     py::arg("keys"), py::arg("values"),
                     py::arg("size_budget") = std::numeric_limits<std::size_t>::max(),
+                    py::arg("write_fraction") = 0.0,
                     "Auto-tune: measure every candidate and keep the best.")
         .def_static("build_with", &ColumnIndex::build_with,
                     py::arg("keys"), py::arg("values"), py::arg("plan"),
@@ -241,10 +381,51 @@ PYBIND11_MODULE(_rmi, m) {
         .def("clear", &IndexCatalog::clear)
         .def("freshness", &IndexCatalog::freshness, py::arg("column"), py::arg("keys"),
              "Whether a stored plan is still evidence about this column.")
-        .def("build_column", &IndexCatalog::build_column,
-             py::arg("column"), py::arg("keys"), py::arg("values"),
-             "Replay the stored plan when it still applies, re-tune when it\n"
-             "does not, and record whatever was actually used.")
+        .def("build_column", [](IndexCatalog& self, const std::string& column,
+                                const std::vector<ColumnKey>& keys,
+                                const std::vector<ColumnValue>& values,
+                                double write_fraction) {
+            Workload workload;
+            workload.write_fraction = write_fraction;
+            return self.build_column(column, keys, values, workload);
+        }, py::arg("column"), py::arg("keys"), py::arg("values"),
+           py::arg("write_fraction") = 0.0,
+           "Replay the stored plan when it still applies, re-tune when it\n"
+           "does not, and record whatever was actually used.\n\n"
+           "A stale plan is re-timed before being thrown away: re-tuning\n"
+           "means rebuilding every candidate, and most changes to a column\n"
+           "do not change which structure is right for it.")
+        .def("explain_column", [](IndexCatalog& self, const std::string& column,
+                                  const std::vector<ColumnKey>& keys,
+                                  const std::vector<ColumnValue>& values,
+                                  double write_fraction) {
+            Workload workload;
+            workload.write_fraction = write_fraction;
+            IndexCatalog::Decision decision;
+            ColumnIndex index =
+                self.build_column(column, keys, values, workload, &decision);
+            py::dict out;
+            out["action"] = decision.action == IndexCatalog::Action::Replayed
+                                ? "replayed"
+                                : decision.action == IndexCatalog::Action::Retuned
+                                      ? "retuned"
+                                      : "chosen";
+            out["freshness"] = decision.freshness == IndexCatalog::Freshness::Fresh
+                                   ? "fresh"
+                                   : decision.freshness == IndexCatalog::Freshness::Stale
+                                         ? "stale"
+                                         : "missing";
+            out["recorded_ns"] = decision.recorded_ns;
+            out["measured_ns"] = decision.measured_ns;
+            out["kind"] = std::string(to_string(index.kind()));
+            return out;
+        }, py::arg("column"), py::arg("keys"), py::arg("values"),
+           py::arg("write_fraction") = 0.0,
+           "build_column, but reporting why the column got what it got.")
+        .def_property("retune_threshold", &IndexCatalog::retune_threshold,
+                      &IndexCatalog::set_retune_threshold,
+                      "How much slower a replayed stale plan may be before a\n"
+                      "full re-tune is worth paying for. Default 1.5.")
         .def("serialize", &IndexCatalog::serialize)
         .def_static("parse", &IndexCatalog::parse, py::arg("blob"))
         .def("save", &IndexCatalog::save, py::arg("path"))

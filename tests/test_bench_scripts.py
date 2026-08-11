@@ -139,9 +139,93 @@ def test_bench_vector_filtered_crossover_runs():
     assert "flat" in out and "hnsw" in out
 
 
+def test_merge_threshold_sweep_runs_and_checks_itself():
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_merge_threshold.py",
+                    ["--quick", "-n", "20000", "--ops", "4000"])
+    assert proc.returncode == 0, out
+    # The oracle guard has to have been armed, not merely not tripped.
+    assert "checked against a dict oracle" in out
+    assert "MISMATCH" not in out, out
+    assert "tau_e" in out and "off" in out, "the control arm is missing"
+
+
+def test_merge_threshold_sweep_reports_the_cost_of_being_writable():
+    """The number most easily left out. If this row ever disappears, the
+    sweep is quietly only reporting the flattering half."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_merge_threshold.py",
+                    ["--quick", "-n", "20000", "--ops", "3000"])
+    assert proc.returncode == 0, out
+    assert "What being writable costs" in out
+    assert "static RMIndex" in out
+
+
+def test_bench_sosd_falls_back_to_synthetic_without_a_download():
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("bench_sosd.py", ["--synthetic", "--limit", "50000"])
+    assert proc.returncode == 0, out
+    assert "ns/lookup" in out
+    assert "choose_index() picked" in out
+    assert "synthetic:clustered" in out
+
+
+def test_fetch_data_explains_sosd_without_downloading_anything():
+    proc, out = run("fetch_data.py", ["sosd"])
+    assert proc.returncode == 0, out
+    assert "fb_200M_uint64" in out
+    assert "dataverse" in out.lower()
+    assert "duplicate keys" in out
+
+
+def test_router_scaling_study_runs_and_matches_recall():
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_router_scaling.py",
+                    ["--quick", "--random", "30000x16", "--queries", "60",
+                     "--recall", "0.99", "--sizes", "4000,8000"])
+    assert proc.returncode == 0, out
+    assert "Matched recall@10" in out
+    assert "p1 gain" in out, "the extra-entry-point control is missing"
+    assert "descent" in out
+
+
+def test_router_scaling_refuses_a_degenerate_comparison():
+    """If the target recall is reachable at the smallest ef for every n, no
+    row is at its matched-recall point and the gains are not comparable. The
+    script has to say so rather than print a trend."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_router_scaling.py",
+                    ["--quick", "--random", "20000x16", "--queries", "50",
+                     "--recall", "0.10", "--sizes", "4000,8000"])
+    assert proc.returncode == 0, out
+    assert "WARNING" in out and "too easy" in out
+    assert "benefit grows" not in out, "drew a trend from a degenerate table"
+
+
+def test_printed_output_is_console_safe():
+    """Windows consoles are cp1252 by default, and an em-dash in a print()
+    has already cost this project one UnicodeEncodeError. Cheaper to assert
+    than to rediscover."""
+    for script in ("bench_sosd.py", "experiment_merge_threshold.py",
+                   "fetch_data.py", "experiment_router_scaling.py"):
+        text = (SCRIPTS / script).read_text(encoding="utf-8")
+        for number, line in enumerate(text.split("\n"), start=1):
+            stripped = line.lstrip()
+            if not stripped.startswith(("print(", '"', "f\"")):
+                continue
+            assert "—" not in line, f"{script}:{number} em-dash in output"
+
+
 def test_scripts_report_their_own_usage():
     for script in ("bench_index.py", "experiment_curvature.py",
-                   "experiment_stage1.py", "bench_vector.py"):
+                   "experiment_stage1.py", "bench_vector.py",
+                   "experiment_merge_threshold.py", "bench_sosd.py",
+                   "experiment_router_scaling.py"):
         proc, out = run(script, ["--help"])
         assert proc.returncode == 0, out
         assert "usage:" in out.lower()

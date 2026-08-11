@@ -16,4 +16,4 @@ shared between the B+ tree and the learned index.
 """
 
 from hylis._flat import FlatIndex, Metric, Neighbor  # noqa: F401
-from hylis._hnsw import HnswIndex, HnswStats  # noqa: F401
+from hylis._hnsw import HnswIndex, HnswStats, RouterHealth  # noqa: F401

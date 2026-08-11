@@ -6,6 +6,8 @@ bug here would not fail loudly, it would just produce plausible-looking
 recall figures that mean nothing.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -290,3 +292,67 @@ def test_hybrid_generation_is_deterministic():
     b = ds.make_hybrid(seed=9)
     assert np.array_equal(a.attributes["price"], b.attributes["price"])
     assert np.array_equal(a.vectors.base, b.vectors.base)
+
+
+# ------------------------------------------------------------------- SOSD
+
+
+def test_sosd_round_trips(tmp_path):
+    path = tmp_path / "toy_1M_uint64"
+    ds.write_sosd(path, np.array([5, 3, 9, 1, 100], dtype=np.uint64))
+    keys = ds.read_sosd(path)
+    assert keys.dtype == np.int64, "every index in hylis is keyed on int64"
+    assert keys.tolist() == [1, 3, 5, 9, 100], "sorted, as the indexes require"
+
+
+def test_sosd_reports_the_duplicates_it_dropped():
+    """SOSD corpora contain duplicates and our indexes require unique keys, so
+    de-duplication is mandatory -- which means the corpus measured is not the
+    corpus published. The count is carried so that is visible."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dup_uint64"
+        ds.write_sosd(path, np.array([4, 4, 4, 7, 7, 9], dtype=np.uint64))
+        got = ds.load_sosd(path)
+        assert len(got) == 3
+        assert got.total_read == 6
+        assert got.dropped == 3
+        assert got.duplicate_fraction == 0.5
+        assert "duplicates" in got.as_dataset().description
+
+
+def test_sosd_limit_reads_a_prefix(tmp_path):
+    path = tmp_path / "big_uint32"
+    ds.write_sosd(path, np.arange(1000, dtype=np.uint32))
+    assert len(ds.read_sosd(path, limit=10)) == 10
+    assert len(ds.read_sosd(path)) == 1000
+
+
+def test_sosd_refuses_to_guess_the_key_width(tmp_path):
+    """The width is in the filename, not the file. Guessing it wrong reads
+    garbage that still parses cleanly, so this has to fail loudly."""
+    path = tmp_path / "mystery"
+    ds.write_sosd(tmp_path / "x_uint64", np.array([1, 2], dtype=np.uint64))
+    (tmp_path / "x_uint64").rename(path)
+    with pytest.raises(ValueError, match="cannot tell the key width"):
+        ds.read_sosd(path)
+
+
+def test_sosd_detects_a_truncated_file(tmp_path):
+    path = tmp_path / "short_uint64"
+    ds.write_sosd(path, np.array([1, 2, 3, 4], dtype=np.uint64))
+    raw = path.read_bytes()
+    path.write_bytes(raw[: 8 + 16])  # header promises 4 keys, only 2 follow
+    with pytest.raises(ValueError, match="truncated"):
+        ds.read_sosd(path)
+
+
+def test_sosd_becomes_a_normal_key_dataset(tmp_path):
+    """So every tool that already accepts a KeyDataset accepts SOSD too."""
+    path = tmp_path / "toy_uint64"
+    ds.write_sosd(path, np.array([10, 20, 30, 40], dtype=np.uint64))
+    kd = ds.load_sosd(path).as_dataset()
+    assert len(kd) == 4
+    mean_error, max_error = kd.position_error()
+    assert mean_error >= 0.0 and max_error >= 0.0

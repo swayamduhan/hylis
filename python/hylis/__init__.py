@@ -15,6 +15,9 @@ from hylis.index import (  # noqa: F401
     BPlusTree,
     ColumnIndex,
     CompareOp,
+    DynamicConfig,
+    DynamicRMIndex,
+    DynamicStats,
     IndexCatalog,
     IndexKind,
     IndexPlan,
@@ -29,6 +32,7 @@ from hylis.vector import (  # noqa: F401
     HnswStats,
     Metric,
     Neighbor,
+    RouterHealth,
 )
 
 __version__ = "0.1.0"
