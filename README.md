@@ -126,8 +126,45 @@ one. That comparison is why hnswlib is vendored as a benchmark baseline
 (`-DHYLIS_WITH_HNSWLIB=OFF` to build without it); a router that beat a slow
 baseline would have proved nothing.
 
-The advantage should grow with corpus size, since the descent lengthens while
-inference stays O(1) — `--sift1m` runs the same benchmark at 1M vectors.
+### At 1M vectors, the router earns its place
+
+The 10K result was near-parity on throughput. Scaling to SIFT1M — where the
+graph is 100× larger — is where the idea is actually testable:
+
+```
+index        ef   recall@10        QPS   visited  routing
+flat          -      1.0000         20 1,000,000        -
+hnswlib      20      0.8012     19,410         -        -
+hnsw         20      0.7846      7,567       650        4
+routed       20      0.7934      9,350       493        0
+hnsw        160      0.9914      1,766     2,787        4
+routed      160      0.9914      1,667     2,625        0
+```
+
+**+24% throughput at ef=20 and +31% at ef=10**, with recall unchanged — up
+from parity at 10K. The mechanism is visible in `visited`: the router cuts
+nodes scanned by 34% at ef=10, 24% at ef=20, and progressively less as the
+beam widens. **The advantage shrinks as ef rises and reverses by ef=160**,
+where a wide beam finds good neighbours regardless of where it started and
+the router's inference is pure overhead.
+
+So the honest claim is narrow and real: *a learned router pays off at low ef
+and large n — exactly the regime where the entry point matters and there is
+no beam width to recover from a bad one.*
+
+Two costs to state alongside it:
+
+**Our build is ~2.3× slower than hnswlib's** (12.1 min vs 5.3 min at 1M) and
+superlinear in n — 4× the data at 80k costs 14× the time. At matched ef the
+recall tracks hnswlib closely (0.9914 vs 0.9920 at ef=160), so the gap is
+engineering, not algorithm, but it is real.
+
+**The layer-0-only configuration does not scale.** The router replaces the
+hierarchy at *query* time, but insertion still descends it — so with no upper
+layers every insert walks layer 0 from a fixed entry point, and the build cost
+grows worse than the normal one (1.5× at 80k, widening). `bench_router.py`
+skips it above 200k. Making the router usable *during construction* is the
+obvious next step and is not in this module.
 
 ## The learned index
 
