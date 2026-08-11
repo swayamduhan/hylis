@@ -443,3 +443,188 @@ TEST(IndexCatalog, EraseAndColumns) {
     catalog.clear();
     EXPECT_TRUE(catalog.empty());
 }
+
+// ------------------------------------------------- workload-aware selection
+
+// The reason Workload exists. On lookups alone the static RMI wins nearly
+// everything, and it is build-only — so without the write rate the selector
+// would hand an immutable structure to a column that is about to be written
+// to, and the first insert would throw.
+TEST(WorkloadAwareSelection, NeverOffersAnImmutableIndexToAWrittenColumn) {
+    std::vector<ColumnKey> keys;
+    std::vector<ColumnValue> values;
+    for (int i = 0; i < 50000; ++i) {
+        keys.push_back(static_cast<ColumnKey>(i) * 3);
+        values.push_back(i);
+    }
+
+    hylis::index::Workload read_only;
+    const IndexPlan cold = choose_index(keys, values, SIZE_MAX, read_only);
+    EXPECT_EQ(cold.kind, IndexKind::RMI)
+        << "a read-only column should still get the fastest thing available";
+
+    for (double fraction : {0.01, 0.5, 1.0}) {
+        hylis::index::Workload writes;
+        writes.write_fraction = fraction;
+        const IndexPlan plan = choose_index(keys, values, SIZE_MAX, writes);
+        EXPECT_TRUE(hylis::index::is_mutable(plan.kind))
+            << "chose " << hylis::index::to_string(plan.kind)
+            << " for a column with write_fraction " << fraction;
+        EXPECT_GT(plan.ns_per_write, 0.0) << "writes were not actually timed";
+    }
+}
+
+TEST(WorkloadAwareSelection, AStaticRMIRefusesWritesClearly) {
+    std::vector<ColumnKey> keys;
+    std::vector<ColumnValue> values;
+    for (int i = 0; i < 1000; ++i) {
+        keys.push_back(static_cast<ColumnKey>(i) * 3);
+        values.push_back(i);
+    }
+    IndexPlan plan;
+    plan.kind = IndexKind::RMI;
+    ColumnIndex index = ColumnIndex::build_with(keys, values, plan);
+
+    EXPECT_FALSE(index.is_mutable());
+    // Not "returns false" — that would read as "the key was already there".
+    EXPECT_THROW(index.insert(7, 7), std::logic_error);
+    EXPECT_THROW(index.erase(0), std::logic_error);
+}
+
+TEST(WorkloadAwareSelection, TheDynamicIndexAnswersLikeEveryOtherKind) {
+    std::vector<ColumnKey> keys;
+    std::vector<ColumnValue> values;
+    std::map<ColumnKey, ColumnValue> oracle;
+    for (int i = 0; i < 20000; ++i) {
+        keys.push_back(static_cast<ColumnKey>(i) * 7);
+        values.push_back(i * 2);
+        oracle[keys.back()] = values.back();
+    }
+
+    IndexPlan plan;
+    plan.kind = IndexKind::DynamicRMI;
+    plan.rmi_models = 256;
+    ColumnIndex index = ColumnIndex::build_with(keys, values, plan);
+
+    ASSERT_TRUE(index.is_mutable());
+    EXPECT_TRUE(index.insert(5, 999));
+    oracle[5] = 999;
+    EXPECT_TRUE(index.erase(keys[100]));
+    oracle.erase(keys[100]);
+
+    for (const auto& [key, value] : oracle) {
+        const ColumnValue* got = index.find(key);
+        ASSERT_NE(got, nullptr) << key;
+        EXPECT_EQ(*got, value);
+    }
+    EXPECT_EQ(index.find(keys[100]), nullptr);
+    EXPECT_EQ(index.size(), oracle.size());
+    EXPECT_NO_THROW(index.validate());
+}
+
+// ------------------------------------------------------- the retune policy
+
+// Re-tuning means rebuilding and timing every candidate. Any change to a
+// column makes its plan stale, and most changes do not make it *wrong*, so
+// re-tuning on staleness alone spends the expensive path on columns that
+// would have reached the same answer.
+TEST(RetunePolicy, ATrivialChangeReplaysRatherThanRetuning) {
+    std::vector<ColumnKey> keys;
+    std::vector<ColumnValue> values;
+    for (int i = 0; i < 50000; ++i) {
+        keys.push_back(static_cast<ColumnKey>(i) * 3);
+        values.push_back(i);
+    }
+
+    IndexCatalog catalog;
+    IndexCatalog::Decision decision;
+    catalog.build_column("c", keys, values, hylis::index::Workload{}, &decision);
+    EXPECT_EQ(decision.action, IndexCatalog::Action::Chosen);
+    EXPECT_EQ(decision.freshness, IndexCatalog::Freshness::Missing);
+
+    catalog.build_column("c", keys, values, hylis::index::Workload{}, &decision);
+    EXPECT_EQ(decision.action, IndexCatalog::Action::Replayed);
+    EXPECT_EQ(decision.freshness, IndexCatalog::Freshness::Fresh);
+
+    keys.pop_back();
+    values.pop_back();
+    catalog.build_column("c", keys, values, hylis::index::Workload{}, &decision);
+    EXPECT_EQ(decision.freshness, IndexCatalog::Freshness::Stale)
+        << "one row fewer is a different column by the fingerprint";
+    EXPECT_EQ(decision.action, IndexCatalog::Action::Replayed)
+        << "but not a different *answer*, so it should not have re-tuned";
+    EXPECT_GT(decision.measured_ns, 0.0) << "it should still have been re-timed";
+}
+
+TEST(RetunePolicy, RealDegradationDoesTriggerARetune) {
+    std::vector<ColumnKey> keys;
+    std::vector<ColumnValue> values;
+    for (int i = 0; i < 20000; ++i) {
+        keys.push_back(static_cast<ColumnKey>(i) * 3);
+        values.push_back(i);
+    }
+
+    IndexCatalog catalog;
+    catalog.build_column("c", keys, values);
+
+    // An impossible bar: anything at all counts as degraded. Checks the
+    // branch is reachable, rather than that any particular workload trips it.
+    catalog.set_retune_threshold(0.0);
+    keys.pop_back();
+    values.pop_back();
+
+    IndexCatalog::Decision decision;
+    catalog.build_column("c", keys, values, hylis::index::Workload{}, &decision);
+    EXPECT_EQ(decision.action, IndexCatalog::Action::Retuned);
+}
+
+TEST(RetunePolicy, AChangeOfWorkloadIsNotSomethingAPlanCanSurvive) {
+    std::vector<ColumnKey> keys;
+    std::vector<ColumnValue> values;
+    for (int i = 0; i < 20000; ++i) {
+        keys.push_back(static_cast<ColumnKey>(i) * 3);
+        values.push_back(i);
+    }
+
+    IndexCatalog catalog;
+    ColumnIndex cold = catalog.build_column("c", keys, values);
+    ASSERT_EQ(cold.kind(), IndexKind::RMI);
+
+    // Same keys, so the fingerprint still matches — but the plan is now for
+    // the wrong job, and matching data does not make an immutable structure
+    // able to take writes.
+    hylis::index::Workload writes;
+    writes.write_fraction = 0.5;
+    IndexCatalog::Decision decision;
+    ColumnIndex warm =
+        catalog.build_column("c", keys, values, writes, &decision);
+    EXPECT_EQ(decision.action, IndexCatalog::Action::Chosen);
+    EXPECT_TRUE(warm.is_mutable());
+    EXPECT_NO_THROW(warm.insert(1, 1));
+}
+
+TEST(RetunePolicy, TheNewPlanFieldsSurviveARoundTrip) {
+    IndexPlan plan;
+    plan.kind = IndexKind::DynamicRMI;
+    plan.rmi_models = 512;
+    plan.merge_ratio = 0.02;
+    plan.write_fraction = 0.25;
+    plan.ns_per_lookup = 41.5;
+    plan.ns_per_write = 250.75;
+    plan.n_keys = 1234;
+
+    IndexCatalog catalog;
+    catalog.set("c", plan);
+    const IndexCatalog reloaded = IndexCatalog::parse(catalog.serialize());
+    const IndexPlan back = *reloaded.get("c");
+
+    EXPECT_EQ(back.kind, IndexKind::DynamicRMI);
+    EXPECT_EQ(back.rmi_models, 512u);
+    EXPECT_NEAR(back.merge_ratio, 0.02, 1e-9);
+    EXPECT_NEAR(back.write_fraction, 0.25, 1e-9);
+    EXPECT_NEAR(back.ns_per_lookup, 41.5, 1e-3);
+    EXPECT_NEAR(back.ns_per_write, 250.75, 1e-3);
+    // Without write_fraction round-tripping, every reloaded plan would look
+    // like it was chosen for a different workload and be re-tuned on sight.
+    EXPECT_EQ(back.n_keys, 1234u);
+}

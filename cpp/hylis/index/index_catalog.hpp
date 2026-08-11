@@ -32,6 +32,7 @@
 #pragma once
 
 #include <cstddef>
+#include <limits>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -60,6 +61,14 @@ inline std::string to_json(const std::string& column, const IndexPlan& plan) {
     // beyond what the measurement itself is worth.
     out += "\"ps_per_lookup\":" +
            std::to_string(static_cast<std::int64_t>(plan.ns_per_lookup * 1000.0)) + ",";
+    out += "\"ps_per_write\":" +
+           std::to_string(static_cast<std::int64_t>(plan.ns_per_write * 1000.0)) + ",";
+    // Both ratios are permilles for the same reason the timings are
+    // picoseconds: the file stays free of floating-point text.
+    out += "\"merge_ratio_permille\":" +
+           std::to_string(static_cast<std::int64_t>(plan.merge_ratio * 1000.0)) + ",";
+    out += "\"write_fraction_permille\":" +
+           std::to_string(static_cast<std::int64_t>(plan.write_fraction * 1000.0)) + ",";
     out += "\"max_error\":" + std::to_string(plan.max_error) + ",";
     out += "\"index_bytes\":" + std::to_string(plan.index_bytes) + ",";
     out += "\"n_keys\":" + std::to_string(plan.n_keys) + ",";
@@ -99,6 +108,12 @@ inline std::pair<std::string, IndexPlan> from_json(const char*& p) {
             plan.btree_order = static_cast<std::size_t>(read_int(p));
         } else if (key == "ps_per_lookup") {
             plan.ns_per_lookup = static_cast<double>(read_int(p)) / 1000.0;
+        } else if (key == "ps_per_write") {
+            plan.ns_per_write = static_cast<double>(read_int(p)) / 1000.0;
+        } else if (key == "merge_ratio_permille") {
+            plan.merge_ratio = static_cast<double>(read_int(p)) / 1000.0;
+        } else if (key == "write_fraction_permille") {
+            plan.write_fraction = static_cast<double>(read_int(p)) / 1000.0;
         } else if (key == "max_error") {
             plan.max_error = static_cast<std::size_t>(read_int(p));
         } else if (key == "index_bytes") {
@@ -157,17 +172,89 @@ public:
         return it->second.matches(keys) ? Freshness::Fresh : Freshness::Stale;
     }
 
+    // How far a stale plan's performance may degrade before it is worth
+    // paying to re-choose.
+    //
+    // Re-choosing means building and timing every candidate structure, which
+    // is the expensive half of this whole subsystem. Any change to the column
+    // makes a plan stale, and most changes do not make it *wrong* — so
+    // triggering a full re-tune on staleness alone spends the expensive path
+    // on columns that were going to reach the same answer anyway.
+    //
+    // Instead: replay the plan, re-time it, and compare against the figure
+    // recorded when it was chosen. Re-tune only if it has actually got worse
+    // by this factor. Same measure-don't-model stance choose_index() already
+    // takes, applied one level up to the decision to re-decide.
+    void set_retune_threshold(double factor) { retune_factor_ = factor; }
+    double retune_threshold() const { return retune_factor_; }
+
+    // Why a column got the structure it got, for tests and for reporting.
+    enum class Action { Replayed, Retuned, Chosen };
+
+    struct Decision {
+        Action action = Action::Chosen;
+        Freshness freshness = Freshness::Missing;
+        // Only meaningful when the plan was replayed and re-timed.
+        double recorded_ns = 0.0;
+        double measured_ns = 0.0;
+    };
+
     // Build a column, replaying the stored plan when it still applies and
     // re-tuning when it does not. The catalog is updated with whatever was
     // actually used, so the next run replays the current decision.
     ColumnIndex build_column(const std::string& column,
                              const std::vector<ColumnKey>& keys,
-                             const std::vector<ColumnValue>& values) {
-        ColumnIndex index =
-            freshness(column, keys) == Freshness::Fresh
-                ? ColumnIndex::build_with(keys, values, *get(column))
-                : ColumnIndex::build(keys, values);
+                             const std::vector<ColumnValue>& values,
+                             Workload workload = Workload{}) {
+        Decision ignored;
+        return build_column(column, keys, values, workload, &ignored);
+    }
+
+    ColumnIndex build_column(const std::string& column,
+                             const std::vector<ColumnKey>& keys,
+                             const std::vector<ColumnValue>& values,
+                             Workload workload,
+                             Decision* decision) {
+        Decision out;
+        out.freshness = freshness(column, keys);
+        const std::optional<IndexPlan> stored = get(column);
+
+        // A plan that cannot serve this workload is not a candidate at all,
+        // however well it fits the keys — a static RMI cannot take writes.
+        const bool usable = stored.has_value() && stored->serves(workload) &&
+                            stored->write_fraction == workload.write_fraction;
+
+        if (usable && out.freshness == Freshness::Fresh) {
+            out.action = Action::Replayed;
+            ColumnIndex index = ColumnIndex::build_with(keys, values, *stored);
+            set(column, index.plan());
+            if (decision) *decision = out;
+            return index;
+        }
+
+        if (usable && out.freshness == Freshness::Stale) {
+            // Stale, but maybe only technically. Measure before spending.
+            const IndexPlan replayed = measure_plan(keys, values, *stored, workload);
+            out.recorded_ns = stored->ns_per_lookup;
+            out.measured_ns = replayed.ns_per_lookup;
+
+            const bool still_good =
+                stored->ns_per_lookup > 0.0 &&
+                replayed.ns_per_lookup <= stored->ns_per_lookup * retune_factor_;
+            if (still_good) {
+                out.action = Action::Replayed;
+                ColumnIndex index = ColumnIndex::build_with(keys, values, *stored);
+                set(column, index.plan());
+                if (decision) *decision = out;
+                return index;
+            }
+            out.action = Action::Retuned;
+        }
+
+        ColumnIndex index = ColumnIndex::build(
+            keys, values, std::numeric_limits<std::size_t>::max(), workload);
         set(column, index.plan());
+        if (decision) *decision = out;
         return index;
     }
 
@@ -253,6 +340,11 @@ public:
     }
 
 private:
+    // See set_retune_threshold(). 1.5 is a starting point, not a measured
+    // value: it says "half again as slow is worth re-deciding for", and the
+    // thing it protects against is paying to rebuild every candidate because
+    // a column grew by one row.
+    double retune_factor_ = 1.5;
     std::map<std::string, IndexPlan> plans_;
 };
 

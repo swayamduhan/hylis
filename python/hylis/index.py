@@ -12,6 +12,9 @@ either without knowing which is underneath.
 from hylis._btree import BPlusTree, CompareOp  # noqa: F401
 from hylis._rmi import (  # noqa: F401
     ColumnIndex,
+    DynamicConfig,
+    DynamicRMIndex,
+    DynamicStats,
     IndexCatalog,
     IndexKind,
     IndexPlan,

@@ -390,6 +390,139 @@ def read_fvecs(path: str | Path, limit: int | None = None) -> np.ndarray:
     return np.ascontiguousarray(rows[:, 1:].view(np.float32))
 
 
+@dataclass(frozen=True)
+class SosdKeys:
+    """A SOSD corpus, after being made usable as an index key set.
+
+    ``dropped`` is not decoration. SOSD files contain duplicate keys, and both
+    of our indexes require strictly ascending unique ones -- ``RMIndex.build``
+    raises on anything else. De-duplicating is therefore mandatory, and it
+    means the corpus being measured is not quite the corpus the published
+    numbers were measured on. Carrying the count makes that visible instead of
+    silently changing the dataset and comparing anyway.
+    """
+
+    keys: np.ndarray
+    name: str
+    total_read: int
+    dropped: int
+
+    def __len__(self) -> int:
+        return int(self.keys.shape[0])
+
+    @property
+    def duplicate_fraction(self) -> float:
+        return self.dropped / self.total_read if self.total_read else 0.0
+
+    def as_dataset(self) -> "KeyDataset":
+        """The same keys as a KeyDataset, so every existing tool accepts them."""
+        return KeyDataset(
+            keys=self.keys,
+            values=np.arange(len(self), dtype=np.int64) * 10,
+            name=self.name,
+            description=(
+                f"SOSD {self.name}: {len(self):,} unique keys of "
+                f"{self.total_read:,} read ({self.duplicate_fraction:.2%} duplicates)"
+            ),
+        )
+
+
+def read_sosd(path: str | Path, limit: int | None = None) -> np.ndarray:
+    """Read a SOSD key file into a sorted, unique int64 array.
+
+    Format: an 8-byte little-endian uint64 count, then that many keys, each
+    uint32 or uint64. The width is not in the file -- it is in the filename,
+    which is why SOSD names them ``books_200M_uint32`` and ``fb_200M_uint64``.
+    Guessing it wrong reads garbage that still parses, so the suffix is
+    required rather than inferred from the file size.
+
+    ``limit`` reads a prefix. A 200M-key uint64 file is 1.6 GB, and being able
+    to work at 10M without holding all of it is the difference between this
+    being usable on a laptop and not.
+
+    Returns keys sorted and de-duplicated, because that is what the indexes
+    require; use ``load_sosd`` if you want to know how many were dropped.
+    """
+    path = Path(path)
+    name = path.name.lower()
+    if name.endswith("uint32"):
+        dtype = np.uint32
+    elif name.endswith("uint64"):
+        dtype = np.uint64
+    else:
+        raise ValueError(
+            f"{path.name}: cannot tell the key width from the filename. SOSD "
+            f"files end in 'uint32' or 'uint64' and the width is not stored in "
+            f"the file, so it cannot be inferred -- rename it or pass the "
+            f"original file."
+        )
+
+    with open(path, "rb") as fh:
+        header = fh.read(8)
+        if len(header) < 8:
+            raise ValueError(f"{path}: shorter than its 8-byte header")
+        count = int(np.frombuffer(header, dtype="<u8", count=1)[0])
+        if count == 0:
+            raise ValueError(f"{path}: header says it holds no keys")
+        want = count if limit is None else min(count, int(limit))
+        raw = np.fromfile(fh, dtype=dtype, count=want)
+
+    if raw.size < want:
+        raise ValueError(
+            f"{path}: header promises {count:,} keys but only {raw.size:,} "
+            f"could be read; the file is truncated"
+        )
+
+    # int64, not the native width: uint64 keys above 2^63 would come out
+    # negative, and every index in this project is keyed on int64. SOSD's
+    # published corpora stay well inside that range, so this is a widening
+    # rather than a lossy cast -- but check it rather than assume it.
+    if dtype is np.uint64 and raw.size and raw.max() > np.iinfo(np.int64).max:
+        raise ValueError(
+            f"{path}: holds keys above 2^63, which do not fit the int64 key "
+            f"type used throughout hylis"
+        )
+    keys = np.unique(raw.astype(np.int64))
+    return keys
+
+
+def load_sosd(path: str | Path, limit: int | None = None) -> SosdKeys:
+    """``read_sosd`` plus the accounting of what de-duplication removed."""
+    path = Path(path)
+    name = path.name.lower()
+    dtype = np.uint32 if name.endswith("uint32") else np.uint64
+    with open(path, "rb") as fh:
+        header = fh.read(8)
+        if len(header) < 8:
+            raise ValueError(f"{path}: shorter than its 8-byte header")
+        count = int(np.frombuffer(header, dtype="<u8", count=1)[0])
+    total = count if limit is None else min(count, int(limit))
+
+    keys = read_sosd(path, limit=limit)
+    return SosdKeys(
+        keys=keys,
+        name=path.name,
+        total_read=total,
+        dropped=total - int(keys.shape[0]),
+    )
+
+
+def write_sosd(path: str | Path, keys: np.ndarray) -> None:
+    """Write a SOSD-format key file. Used by the tests to round-trip."""
+    path = Path(path)
+    name = path.name.lower()
+    if name.endswith("uint32"):
+        dtype = np.uint32
+    elif name.endswith("uint64"):
+        dtype = np.uint64
+    else:
+        raise ValueError(f"{path.name}: name must end in 'uint32' or 'uint64'")
+    payload = np.asarray(keys, dtype=dtype)
+    with open(path, "wb") as fh:
+        fh.write(np.array([payload.size], dtype="<u8").tobytes())
+        fh.write(payload.tobytes())
+
+
 def read_ivecs(path: str | Path, limit: int | None = None) -> np.ndarray:
     """Read an ``.ivecs`` file into an (n, dim) int32 array.
 

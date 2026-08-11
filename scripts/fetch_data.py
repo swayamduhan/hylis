@@ -75,6 +75,65 @@ DATASETS: dict[str, Dataset] = {
 }
 
 
+# SOSD (Marcus et al., "Benchmarking Learned Indexes", VLDB 2021) is the
+# standard corpus for the claim module 4 makes, and `fb` in particular is the
+# adversarial case rmi.hpp already predicts a B+ tree should win.
+#
+# It is not listed in DATASETS because it is not automatically fetchable the
+# way TEXMEX is: the files live on Harvard Dataverse behind per-file numeric
+# ids that are not derivable from the dataset name. Guessing them would
+# produce a script that fails confusingly, and pasting ids copied from a page
+# without having downloaded through them would be pinning something unverified
+# — the same reasoning as the sha256 policy above.
+#
+# So this prints what to fetch and where to put it, and hylis.datasets.read_sosd
+# reads whatever is dropped into data/. Nothing about that is worse than an
+# automated download except the convenience.
+SOSD_DOI = "doi:10.7910/DVN/JGVF9A"
+SOSD_LANDING = "https://dataverse.harvard.edu/dataset.xhtml?persistentId=" + SOSD_DOI
+
+# Plain ASCII in anything that gets printed: the Windows console is cp1252 by
+# default, and an em-dash in a print() has already cost this project one
+# UnicodeEncodeError.
+SOSD_FILES = [
+    ("books_200M_uint64", 1600, "Amazon book sale popularity: smooth, mildly skewed"),
+    ("fb_200M_uint64", 1600, "Facebook user ids: heavy gaps, the adversarial case"),
+    ("osm_cellids_200M_uint64", 1600, "OpenStreetMap cell ids: spatially clustered"),
+    ("wiki_ts_200M_uint64", 1600, "Wikipedia edit timestamps: near-uniform with bursts"),
+]
+
+
+def print_sosd_help() -> None:
+    print("SOSD key corpora (learned-index benchmark, VLDB 2021)\n")
+    for name, mb, description in SOSD_FILES:
+        print(f"  {name:<26} ~{mb:>5} MB   {description}")
+    print(f"\nDownload from Harvard Dataverse:\n    {SOSD_LANDING}\n")
+    print(f"and place the files directly in {DATA_DIR} (no subdirectory).\n")
+    print("Then, without needing all 200M keys resident:")
+    print("    python scripts/bench_sosd.py --limit 10000000\n")
+    print("Notes:")
+    print("  * The key width is taken from the filename suffix and is not")
+    print("    stored in the file, so do not rename them.")
+    print("  * These corpora contain duplicate keys. Both indexes require")
+    print("    strictly ascending unique keys, so the loader de-duplicates and")
+    print("    reports how many it dropped -- the measured corpus is slightly")
+    print("    smaller than the published one, and that is stated rather than")
+    print("    quietly absorbed.")
+    print("  * Nothing is blocked on this: hylis.datasets.synthetic_keys covers")
+    print("    every distribution shape offline, including the clustered one")
+    print("    that mimics `fb`.")
+
+
+def existing_sosd() -> list[Path]:
+    """SOSD-format files already sitting in data/."""
+    if not DATA_DIR.exists():
+        return []
+    return sorted(
+        p for p in DATA_DIR.iterdir()
+        if p.is_file() and p.name.lower().endswith(("uint32", "uint64"))
+    )
+
+
 def human(n_bytes: int) -> str:
     size = float(n_bytes)
     for unit in ("B", "KB", "MB", "GB"):
@@ -224,13 +283,28 @@ def main(argv: list[str] | None = None) -> int:
         help=f"one or more of: {', '.join(DATASETS)}",
     )
     parser.add_argument("--list", action="store_true", help="show available datasets")
+    parser.add_argument("--sosd", action="store_true",
+                        help="how to obtain the SOSD key corpora")
     parser.add_argument("--force", action="store_true", help="re-download if present")
     args = parser.parse_args(argv)
+
+    if "sosd" in args.datasets or args.sosd:
+        print_sosd_help()
+        present = existing_sosd()
+        if present:
+            print(f"\nAlready in {DATA_DIR}:")
+            for p in present:
+                print(f"  {p.name:<26} {human(p.stat().st_size)}")
+        args.datasets = [d for d in args.datasets if d != "sosd"]
+        if not args.datasets:
+            return 0
 
     if args.list or not args.datasets:
         print("Available datasets:\n")
         for ds in DATASETS.values():
             print(f"  {ds.name:<12} ~{ds.approx_mb:>4} MB   {ds.description}")
+        print(f"  {'sosd':<12}  manual   "
+              f"learned-index key corpora; run `fetch_data.py sosd` for how")
         print(f"\nDownloaded into {DATA_DIR} (git-ignored).")
         print("hylis.datasets works offline without any of these.")
         return 0
