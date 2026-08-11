@@ -127,6 +127,13 @@ def main(argv=None) -> int:
     parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--samples", type=int, default=40_000)
+    parser.add_argument("--flat-only", action="store_true",
+                        help="force the layer-0-only build even on a large "
+                             "corpus; it is skipped by default because its "
+                             "build cost grows badly with n")
+    parser.add_argument("--flat-only-limit", type=int, default=200_000,
+                        help="corpus size above which the layer-0-only build "
+                             "is skipped")
     parser.add_argument("--queries", type=int, default=0,
                         help="cap the query set; 0 uses all of it. Worth "
                              "setting on SIFT1M, where an exhaustive scan of "
@@ -172,22 +179,40 @@ def main(argv=None) -> int:
                                           M=16, ef_construction=200)
         lib_build = timed(lib.add_batch, corpus.base)
 
-    flat_only = HnswIndex(corpus.dim, Metric.L2, 16, 200, 100, True)
-    flat_only.reserve(corpus.n)
-    flat_only_build = timed(flat_only.add_batch, corpus.base)
-    flat_only.set_router(router)
+    # Building a layer-0-only graph is markedly more expensive than a normal
+    # one, and gets worse with n: with no hierarchy, every insertion starts at
+    # the fixed global entry point and has to walk layer 0 to reach the right
+    # region. Measured at 1.0x the normal build at 20k but 1.5x at 80k, so at
+    # a million vectors it is tens of minutes on its own.
+    #
+    # That is worth stating rather than hiding: the router replaces the
+    # hierarchy at *query* time, but insertion still relies on it, so a
+    # flat-only graph is not currently practical to build at scale.
+    flat_only = None
+    flat_only_build = 0.0
+    build_flat_only = args.flat_only or corpus.n <= args.flat_only_limit
+    if build_flat_only:
+        flat_only = HnswIndex(corpus.dim, Metric.L2, 16, 200, 100, True)
+        flat_only.reserve(corpus.n)
+        flat_only_build = timed(flat_only.add_batch, corpus.base)
+        flat_only.set_router(router)
+    else:
+        print(f"  skipping the layer-0-only build ({corpus.n:,} vectors is over "
+              f"the {args.flat_only_limit:,} limit; --flat-only to force it)")
 
     stats = graph.stats()
-    flat_stats = flat_only.stats()
+    flat_stats = flat_only.stats() if flat_only is not None else None
     print()
     print(f"build   flat {flat_build*1000:7.0f} ms   hnsw {graph_build*1000:7.0f} ms"
           f"   hnswlib {lib_build*1000:7.0f} ms")
     print(f"graph   {human_bytes(stats.graph_bytes)} over "
           f"{human_bytes(stats.total_bytes - stats.graph_bytes)} of vectors; "
           f"{stats.levels} levels {stats.layer_population}")
-    print(f"        layer-0-only build: {human_bytes(flat_stats.graph_bytes)} "
-          f"({(stats.graph_bytes - flat_stats.graph_bytes) / max(stats.graph_bytes,1):.1%}"
-          f" of the graph was the hierarchy)")
+    if flat_stats is not None:
+        print(f"        layer-0-only build: {human_bytes(flat_stats.graph_bytes)} "
+              f"({(stats.graph_bytes - flat_stats.graph_bytes) / max(stats.graph_bytes,1):.1%}"
+              f" of the graph was the hierarchy), built in "
+              f"{flat_only_build*1000:.0f} ms")
     print()
 
     # -- recall / throughput ---------------------------------------------
@@ -230,9 +255,10 @@ def main(argv=None) -> int:
     sweep("routed",
           lambda ef: graph.search_batch(corpus.queries, k=k, ef=ef, use_router=True)[0],
           lambda ef: graph_visits(ef, True))
-    sweep("flat-only",
-          lambda ef: flat_only.search_batch(corpus.queries, k=k, ef=ef,
-                                            use_router=True)[0])
+    if flat_only is not None:
+        sweep("flat-only",
+              lambda ef: flat_only.search_batch(corpus.queries, k=k, ef=ef,
+                                                use_router=True)[0])
 
     print()
     print("Reading this table:")

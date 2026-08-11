@@ -13,3 +13,6 @@ data/
 
 # pip install -e . metadata; regenerated on every install
 *.egg-info/
+
+# ad-hoc benchmark output
+sift1m_result.txt
