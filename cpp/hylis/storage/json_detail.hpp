@@ -14,6 +14,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace hylis::storage::json_detail {
 
@@ -116,6 +117,34 @@ inline std::string read_string(const char*& p) {
     return out;
 }
 
+inline double read_double(const char*& p) {
+    char* end = nullptr;
+    const double v = std::strtod(p, &end);
+    if (end == p) throw std::runtime_error("expected number");
+    p = end;
+    return v;
+}
+
+// Reads a flat [n, n, ...] array of numbers. Used for neural-router weights,
+// which are the only float payload in the project — everything else the
+// engine persists is strings and integers.
+inline std::vector<double> read_number_array(const char*& p) {
+    std::vector<double> out;
+    skip_ws(p);
+    expect(p, '[');
+    skip_ws(p);
+    if (*p == ']') { ++p; return out; }
+    while (true) {
+        skip_ws(p);
+        out.push_back(read_double(p));
+        skip_ws(p);
+        if (*p == ',') { ++p; continue; }
+        if (*p == ']') { ++p; break; }
+        throw std::runtime_error("expected , or ] in number array");
+    }
+    return out;
+}
+
 // Reads a flat {"str":"str", ...} object into a map.
 inline std::map<std::string, std::string> read_string_object(const char*& p) {
     std::map<std::string, std::string> out;
@@ -145,6 +174,18 @@ inline void skip_value(const char*& p) {
     if (*p == '"') { (void)read_string(p); }
     else if (*p == '{') { (void)read_string_object(p); }
     else if (*p == 'n') { (void)consume_null(p); }
+    else if (*p == '[') {
+        // Arrays need real bracket matching: the bare-token fallback below
+        // stops at the first comma, which is *inside* an array rather than
+        // after it, and would leave the cursor mid-value.
+        int depth = 0;
+        do {
+            if (*p == '[') ++depth;
+            else if (*p == ']') --depth;
+            else if (*p == '"') { (void)read_string(p); continue; }
+            ++p;
+        } while (*p && depth > 0);
+    }
     else { while (*p && *p != ',' && *p != '}') ++p; }
 }
 

@@ -20,7 +20,7 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 | 3 | Brute-force vector  | ✅ |
 | 4 | Learned Index (RMI) | ✅ |
 | 5 | HNSW baseline       | ✅ |
-| 6 | Neural Router       | ☐ |
+| 6 | Neural Router       | ✅ |
 | 7 | Incremental retrain | ☐ |
 | 8 | Query planner       | ☐ |
 | 9 | Benchmarks          | ☐ |
@@ -68,6 +68,66 @@ report timings from a Debug build.
 
 The compiled extensions are written straight into `python/hylis/`, so
 `pytest` works from a clean checkout with no install step.
+
+## The neural router
+
+HNSW's upper layers do exactly one job: hand the layer-0 beam search a
+starting node near the query. The router replaces that walk with a forward
+pass — k-means partitions the corpus, each cluster's *medoid* becomes a
+candidate entry point, and a small MLP classifies query → cluster.
+
+Training needs **nothing collected and nothing labelled**. Inputs are base
+vectors with jitter; labels are the cluster of each sample's true nearest
+neighbour, computed by `FlatIndex`. The exact index built in module 3 to
+*grade* approximate search turns out to also be what *teaches* the router.
+
+```bash
+python scripts/train_router.py --sift     # cluster, label, train, evaluate
+python scripts/bench_router.py            # all four indexes, same corpus
+```
+
+Training is Python; inference is C++. A query costs tens of microseconds, so a
+Python callback per query would cost more than the query does. Weights cross
+as JSON, and a cross-language test asserts both forward passes predict the
+same cluster on every query — a transposed matrix would otherwise give a
+router that loads cleanly, runs fast, routes badly, and corrupts every
+downstream number silently.
+
+### Measured on SIFT10K
+
+```
+index        ef   recall@10        QPS   visited  routing
+flat          -      1.0000        951    10,000        -
+hnswlib      20      0.9820     43,258         -        -
+hnsw         20      0.9630     17,052       363        4
+routed       20      0.9770     16,355       273        0
+```
+
+**The router improves recall and cuts nodes visited by ~25%, but barely moves
+throughput** — MLP inference costs about what the saved traversal did.
+
+Three honest caveats, all of which correct assumptions made while planning
+this module:
+
+**The descent was never expensive.** It costs *4 nodes*, not the ~64 estimated
+— the upper layers hold only 598, 38, 5, 1 nodes, so walking them is nearly
+free. The router's value is therefore not eliminating that cost; it is
+supplying *better* entry points, so the layer-0 beam converges in fewer steps.
+
+**Half the gain is not the network.** Seeding the beam from two entry points
+instead of one is worth +0.007 recall on its own, with random weights. The
+trained network adds a further +0.007. Quoting the +0.014 total as a result
+for "the neural router" would credit it with both.
+
+**Our HNSW is competitive, not a strawman** — hnswlib reaches 0.9820 at ef=20
+where ours reaches 0.9630, and ours is ~2× slower in raw throughput, which is
+the expected gap between a hand-written implementation and a heavily optimised
+one. That comparison is why hnswlib is vendored as a benchmark baseline
+(`-DHYLIS_WITH_HNSWLIB=OFF` to build without it); a router that beat a slow
+baseline would have proved nothing.
+
+The advantage should grow with corpus size, since the descent lengthens while
+inference stays O(1) — `--sift1m` runs the same benchmark at 1M vectors.
 
 ## The learned index
 

@@ -27,6 +27,12 @@ include(GoogleTest)
 function(hylis_add_test name)
     add_executable(${name} ${name}.cpp)
     target_link_libraries(${name} PRIVATE hylis_core GTest::gtest_main)
+    # Benchmark baseline only; tests guard on HYLIS_HAS_HNSWLIB and skip
+    # themselves when it was not fetched.
+    if(HYLIS_HAS_HNSWLIB)
+        target_link_libraries(${name} PRIVATE hnswlib_headers)
+        target_compile_definitions(${name} PRIVATE HYLIS_HAS_HNSWLIB)
+    endif()
     # Tests need a writable temp dir; we pass the source dir so they can make
     # their own per-test subdirs under build/test-tmp.
     target_compile_definitions(${name} PRIVATE
@@ -54,3 +60,5 @@ hylis_add_test(test_flat)
 hylis_add_test(test_rmi)
 hylis_add_test(test_column_index)
 hylis_add_test(test_hnsw)
+hylis_add_test(test_router)
+hylis_add_test(test_three_way)

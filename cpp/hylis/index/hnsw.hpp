@@ -59,6 +59,7 @@
 #include <vector>
 
 #include "index/distance.hpp"
+#include "index/router.hpp"
 
 namespace hylis::index {
 
@@ -86,11 +87,17 @@ public:
     //
     // ef_construction is the beam width used while inserting. It buys graph
     // quality at build time only — it is not a query-time cost.
+    // `flat_only` builds the graph with no layers above 0 at all. The
+    // hierarchy exists solely to supply an entry point, so once a router is
+    // supplying those instead, the upper layers are dead weight — this is the
+    // full-replacement configuration, and the difference in graph_bytes
+    // against a normal build is what the hierarchy actually costs.
     explicit HnswIndex(std::size_t dim, Metric metric = Metric::L2,
                        std::size_t M = 16, std::size_t ef_construction = 200,
-                       std::uint64_t seed = 100)
+                       std::uint64_t seed = 100, bool flat_only = false)
         : dim_(dim), metric_(metric), m_(M), m_max_(M), m_max0_(2 * M),
-          ef_construction_(ef_construction), seed_(seed), rng_(seed) {
+          ef_construction_(ef_construction), seed_(seed), rng_(seed),
+          flat_only_(flat_only) {
         if (dim_ == 0) throw std::invalid_argument("HnswIndex: dim must be > 0");
         if (m_ < 2) throw std::invalid_argument("HnswIndex: M must be >= 2");
         if (ef_construction_ < 1) {
@@ -127,6 +134,37 @@ public:
     // explains why the graph is fast: a few hundred out of a corpus of
     // millions.
     std::size_t last_visited() const { return last_visited_; }
+
+    // Of those, how many were spent just *getting to* layer 0 — walking the
+    // hierarchy, or zero when a router supplied the entry points. This is the
+    // work the router is trying to eliminate, so isolating it is what makes
+    // the comparison interpretable rather than a single opaque total.
+    std::size_t last_routing_visited() const { return last_routing_visited_; }
+
+    // --- neural router ---------------------------------------------------
+    //
+    // Optional. With no router loaded, or with use_router=false, search
+    // behaves exactly as before — the descent is the default and the router
+    // is strictly additive, so the baseline cannot be broken by adding one.
+    void set_router(NeuralRouter router) {
+        router.require_compatible(dim_, count_);
+        router_ = std::move(router);
+    }
+    void clear_router() { router_ = NeuralRouter{}; }
+    bool has_router() const { return !router_.empty(); }
+    const NeuralRouter& router() const { return router_; }
+
+    // How many clusters' medoids seed the beam. More entry points cost more
+    // distance computations but give the search several places to start from,
+    // which matters when the router is unsure.
+    std::size_t router_top_p() const { return router_top_p_; }
+    void set_router_top_p(std::size_t p) { router_top_p_ = std::max<std::size_t>(p, 1); }
+
+    // Whether to also seed the beam with the graph's global entry point.
+    // Cheap insurance against a badly routed query: one extra distance
+    // computation buys a fallback start that is never worse than random.
+    bool router_keeps_global_entry() const { return router_keep_global_; }
+    void set_router_keeps_global_entry(bool keep) { router_keep_global_ = keep; }
 
     void reserve(std::size_t n) {
         data_.reserve(n * dim_);
@@ -225,14 +263,14 @@ public:
     }
 
     std::vector<Neighbor> search(const float* query, std::size_t k,
-                                 std::size_t ef = 0) const {
-        return search_impl(query, k, ef, AcceptAll{});
+                                 std::size_t ef = 0, bool use_router = false) const {
+        return search_impl(query, k, ef, AcceptAll{}, use_router);
     }
 
     std::vector<Neighbor> search(const std::vector<float>& query, std::size_t k,
-                                 std::size_t ef = 0) const {
+                                 std::size_t ef = 0, bool use_router = false) const {
         require_dim(query.size());
-        return search(query.data(), k, ef);
+        return search(query.data(), k, ef, use_router);
     }
 
     // Search restricted to `allowed` ids.
@@ -247,7 +285,8 @@ public:
     // scripts/bench_vector.py, which measures where it lands.
     std::vector<Neighbor> search_filtered(const float* query, std::size_t k,
                                           const std::vector<std::int64_t>& allowed,
-                                          std::size_t ef = 0) const {
+                                          std::size_t ef = 0,
+                                          bool use_router = false) const {
         if (allowed.empty() || k == 0 || count_ == 0) return {};
 
         // Epoch-stamped like the visited set, so marking costs O(|allowed|)
@@ -267,24 +306,27 @@ public:
         return search_impl(query, k, ef,
                            [&marks, epoch](std::uint32_t id) {
                                return marks[id] == epoch;
-                           });
+                           },
+                           use_router);
     }
 
     std::vector<Neighbor> search_filtered(const std::vector<float>& query, std::size_t k,
                                           const std::vector<std::int64_t>& allowed,
-                                          std::size_t ef = 0) const {
+                                          std::size_t ef = 0,
+                                          bool use_router = false) const {
         require_dim(query.size());
-        return search_filtered(query.data(), k, allowed, ef);
+        return search_filtered(query.data(), k, allowed, ef, use_router);
     }
 
     std::vector<std::vector<Neighbor>> search_batch(const float* queries,
                                                     std::size_t n_queries,
                                                     std::size_t k,
-                                                    std::size_t ef = 0) const {
+                                                    std::size_t ef = 0,
+                                                    bool use_router = false) const {
         std::vector<std::vector<Neighbor>> out;
         out.reserve(n_queries);
         for (std::size_t i = 0; i < n_queries; ++i) {
-            out.push_back(search(queries + i * dim_, k, ef));
+            out.push_back(search(queries + i * dim_, k, ef, use_router));
         }
         return out;
     }
@@ -445,10 +487,15 @@ private:
     // Layer for a new node: floor(-ln(U) * mL), an exponential decay that
     // puts ~1/M of nodes on each successive layer.
     std::size_t random_level() {
+        // Still drawn (and discarded) in flat_only mode so the RNG stream —
+        // and therefore every other random decision — matches a normal build
+        // exactly. Otherwise the two graphs would differ for two reasons at
+        // once and the comparison would be worthless.
         std::uniform_real_distribution<double> unit(0.0, 1.0);
         double u = unit(rng_);
         if (u <= 0.0) u = std::numeric_limits<double>::min();
-        return static_cast<std::size_t>(-std::log(u) * level_multiplier_);
+        const std::size_t level = static_cast<std::size_t>(-std::log(u) * level_multiplier_);
+        return flat_only_ ? 0 : level;
     }
 
     float score_to(const float* query, std::size_t node) const {
@@ -615,8 +662,10 @@ private:
 
     template <typename Accept>
     std::vector<Neighbor> search_impl(const float* query, std::size_t k,
-                                      std::size_t ef, Accept accept) const {
+                                      std::size_t ef, Accept accept,
+                                      bool use_router) const {
         last_visited_ = 0;
+        last_routing_visited_ = 0;
         if (count_ == 0 || k == 0) return {};
 
         std::vector<float> scratch;
@@ -629,16 +678,28 @@ private:
 
         const std::size_t beam = std::max(ef ? ef : ef_search_, k);
 
-        std::uint32_t entry = entry_point_;
-        // Descend the sparse upper layers with a beam of 1: they exist to move
-        // the entry point close to the query cheaply, not to find neighbours.
-        for (std::size_t layer = max_level_; layer > 0; --layer) {
-            const std::vector<Neighbor> found =
-                search_layer(q, {entry}, 1, layer, AcceptAll{});
-            if (!found.empty()) entry = static_cast<std::uint32_t>(found[0].id);
+        // Everything above layer 0 exists only to produce these entry points.
+        // The router replaces that walk with one forward pass; the descent is
+        // what it has to beat.
+        std::vector<std::uint32_t> entries;
+        if (use_router && !router_.empty()) {
+            router_.entry_points(q, router_top_p_, entries);
+            if (router_keep_global_ || entries.empty()) entries.push_back(entry_point_);
+        } else {
+            std::uint32_t entry = entry_point_;
+            for (std::size_t layer = max_level_; layer > 0; --layer) {
+                const std::vector<Neighbor> found =
+                    search_layer(q, {entry}, 1, layer, AcceptAll{});
+                if (!found.empty()) entry = static_cast<std::uint32_t>(found[0].id);
+            }
+            entries.push_back(entry);
         }
+        // Whatever was spent above layer 0 is the routing cost — zero graph
+        // nodes for the router, since its cost is arithmetic rather than
+        // traversal, and that difference is exactly the thing being measured.
+        last_routing_visited_ = last_visited_;
 
-        std::vector<Neighbor> found = search_layer(q, {entry}, beam, 0, accept);
+        std::vector<Neighbor> found = search_layer(q, entries, beam, 0, accept);
         if (found.size() > k) found.resize(k);
         for (Neighbor& n : found) n.score = present_score(n.score, metric_);
         return found;
@@ -685,6 +746,12 @@ private:
     mutable std::vector<std::uint32_t> allowed_;
     mutable std::uint32_t allow_epoch_ = 0;
     mutable std::size_t last_visited_ = 0;
+    mutable std::size_t last_routing_visited_ = 0;
+
+    bool flat_only_ = false;
+    NeuralRouter router_;
+    std::size_t router_top_p_ = 2;
+    bool router_keep_global_ = false;
 };
 
 }  // namespace hylis::index

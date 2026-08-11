@@ -27,6 +27,18 @@ project(hylis
 option(HYLIS_BUILD_TESTS  "Build the GoogleTest unit tests"         ON)
 option(HYLIS_BUILD_PYTHON "Build the pybind11 Python bindings"      ON)
 
+# hnswlib is a *benchmark baseline only* — nothing in the engine may depend on
+# it, per the README's from-scratch constraint. It is here to answer one
+# question honestly: is our HNSW competitive, or a strawman that flatters the
+# numbers?
+#
+# Fetching it needs network, exactly as GoogleTest and pybind11 already do, so
+# defaulting it ON adds no new requirement to a fresh clone. Configure with
+# -DHYLIS_WITH_HNSWLIB=OFF to build without it; the `hylis._hnswlib` module is
+# still produced, reports available=False, and every test and benchmark that
+# uses it skips itself.
+option(HYLIS_WITH_HNSWLIB "Fetch nmslib/hnswlib as a benchmark baseline" ON)
+
 # --------------------------------------------------------- build type
 # A bare `cmake -B build` leaves CMAKE_BUILD_TYPE empty on single-config
 # generators, which means no optimisation flag at all — not even -O1. That is
@@ -76,6 +88,36 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # which is correct — the interpreter always provides it.
 if(MINGW)
     add_link_options(-static-libgcc -static-libstdc++ -static)
+endif()
+
+# ------------------------------------------------------------- hnswlib
+# Declared here rather than in a subdirectory so both the tests and the
+# bindings can link it. HYLIS_HAS_HNSWLIB is the single flag everything else
+# keys off.
+set(HYLIS_HAS_HNSWLIB OFF)
+if(HYLIS_WITH_HNSWLIB)
+    include(FetchContent)
+    FetchContent_Declare(
+        hnswlib
+        GIT_REPOSITORY https://github.com/nmslib/hnswlib.git
+        GIT_TAG v0.8.0
+        EXCLUDE_FROM_ALL   # we want the headers, not its examples and tests
+    )
+    FetchContent_MakeAvailable(hnswlib)
+
+    if(EXISTS "${hnswlib_SOURCE_DIR}/hnswlib/hnswlib.h")
+        # Our own interface target rather than hnswlib's, so the include can be
+        # marked SYSTEM — third-party headers should not have to satisfy this
+        # project's -Wall -Wextra -Wpedantic.
+        add_library(hnswlib_headers INTERFACE)
+        target_include_directories(hnswlib_headers SYSTEM INTERFACE
+            "${hnswlib_SOURCE_DIR}")
+        set(HYLIS_HAS_HNSWLIB ON)
+        message(STATUS "hylis: hnswlib available as a benchmark baseline")
+    else()
+        message(WARNING "hylis: hnswlib headers not found after fetch; building "
+                        "without the external baseline.")
+    endif()
 endif()
 
 # -------------------------------------------------------------- subdirs

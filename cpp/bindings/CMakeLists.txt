@@ -24,6 +24,10 @@ set(HYLIS_PY_PACKAGE_DIR "${CMAKE_SOURCE_DIR}/python/hylis")
 function(hylis_add_binding name source)
     pybind11_add_module(${name} ${source})
     target_link_libraries(${name} PRIVATE hylis_core)
+    if(HYLIS_HAS_HNSWLIB)
+        target_link_libraries(${name} PRIVATE hnswlib_headers)
+        target_compile_definitions(${name} PRIVATE HYLIS_HAS_HNSWLIB)
+    endif()
     # Lets Python see how the extension was compiled, so a benchmark can
     # refuse to report timings from an unoptimised build.
     target_compile_definitions(${name} PRIVATE
@@ -58,4 +62,10 @@ endif()
 
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hnsw.cpp")
     hylis_add_binding(_hnsw hnsw.cpp)
+endif()
+
+# Always built, even without hnswlib: the module then reports available=False
+# rather than making `import hylis._hnswlib` fail somewhere unhelpful.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hnswlib.cpp")
+    hylis_add_binding(_hnswlib hnswlib.cpp)
 endif()

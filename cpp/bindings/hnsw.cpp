@@ -21,12 +21,14 @@
 
 #include "build_info.hpp"
 #include "index/hnsw.hpp"
+#include "index/router.hpp"
 
 namespace py = pybind11;
 
 using hylis::index::HnswIndex;
 using hylis::index::Metric;
 using hylis::index::Neighbor;
+using hylis::index::NeuralRouter;
 
 namespace {
 
@@ -70,6 +72,52 @@ PYBIND11_MODULE(_hnsw, m) {
     // registrations visible here rather than duplicating them.
     py::module_::import("hylis._flat");
 
+    py::class_<NeuralRouter>(m, "NeuralRouter",
+        "A learned replacement for HNSW's hierarchical descent.\n\n"
+        "The upper layers exist only to hand the layer-0 search a starting\n"
+        "node near the query. This predicts those entry points directly:\n"
+        "a classifier from query vector to k-means cluster, whose medoids\n"
+        "become the entry nodes.\n\n"
+        "Trained by python/hylis/router.py and loaded here — inference must\n"
+        "be in C++ because a query costs ~30us end to end, and a Python\n"
+        "callback per query would cost more than the query does.")
+        .def(py::init<>())
+        .def_static("from_json", &NeuralRouter::from_json, py::arg("blob"))
+        .def_static("load", &NeuralRouter::load, py::arg("path"))
+        .def("predict", [](const NeuralRouter& self, const FloatArray& query,
+                           std::size_t p) {
+            std::vector<std::uint32_t> out;
+            self.predict(as_vector(query, self.dim(), "predict"), p, out);
+            return out;
+        }, py::arg("query"), py::arg("p") = 1,
+           "Top-p cluster ids, best first.")
+        .def("entry_points", [](const NeuralRouter& self, const FloatArray& query,
+                                std::size_t p) {
+            std::vector<std::uint32_t> out;
+            self.entry_points(as_vector(query, self.dim(), "entry_points"), p, out);
+            return out;
+        }, py::arg("query"), py::arg("p") = 2,
+           "Node ids to seed the beam with: the medoids of the top-p clusters.")
+        .def("logits", [](const NeuralRouter& self, const FloatArray& query) {
+            std::vector<std::uint32_t> ignored;
+            self.predict(as_vector(query, self.dim(), "logits"), 1, ignored);
+            const std::vector<float>& logits = self.last_logits();
+            return py::array_t<float>(static_cast<py::ssize_t>(logits.size()),
+                                      logits.data());
+        }, py::arg("query"),
+           "Raw pre-softmax scores. Exposed so the Python and C++ forward\n"
+           "passes can be compared directly — a transposed weight matrix\n"
+           "would otherwise give a router that 'works' while routing badly.")
+        .def("medoid", &NeuralRouter::medoid, py::arg("cluster"))
+        .def_property_readonly("dim", &NeuralRouter::dim)
+        .def_property_readonly("hidden", &NeuralRouter::hidden)
+        .def_property_readonly("clusters", &NeuralRouter::clusters)
+        .def("__repr__", [](const NeuralRouter& self) {
+            return "NeuralRouter(dim=" + std::to_string(self.dim()) +
+                   ", hidden=" + std::to_string(self.hidden()) +
+                   ", clusters=" + std::to_string(self.clusters()) + ")";
+        });
+
     py::class_<HnswIndex::Stats>(m, "HnswStats", "Shape and cost of a built graph.")
         .def_readonly("nodes", &HnswIndex::Stats::nodes)
         .def_readonly("levels", &HnswIndex::Stats::levels,
@@ -109,13 +157,18 @@ PYBIND11_MODULE(_hnsw, m) {
         "clear O(n) state per query. Use one index per thread.\n\n"
         "No deletion. A node cannot be removed without degrading the graph\n"
         "around it; production systems tombstone and periodically rebuild.")
-        .def(py::init<std::size_t, Metric, std::size_t, std::size_t, std::uint64_t>(),
+        .def(py::init<std::size_t, Metric, std::size_t, std::size_t, std::uint64_t,
+                      bool>(),
              py::arg("dim"), py::arg("metric") = Metric::L2,
              py::arg("M") = 16, py::arg("ef_construction") = 200,
-             py::arg("seed") = 100,
+             py::arg("seed") = 100, py::arg("flat_only") = false,
              "M is links selected per node per layer (2*M allowed at layer 0).\n"
              "ef_construction is the build-time beam width — it buys graph\n"
-             "quality, and costs nothing at query time.")
+             "quality, and costs nothing at query time.\n\n"
+             "flat_only builds no layers above 0 at all: the full-replacement\n"
+             "configuration, where a router is the only way in. The RNG stream\n"
+             "is unchanged, so the layer-0 graph is identical to a normal\n"
+             "build's and the two remain comparable.")
 
         .def("add", [](HnswIndex& self, const FloatArray& vec) {
             return self.add(as_vector(vec, self.dim(), "add"));
@@ -130,22 +183,27 @@ PYBIND11_MODULE(_hnsw, m) {
         }, py::arg("vectors"), "Insert n vectors from an (n, dim) array.")
 
         .def("search", [](const HnswIndex& self, const FloatArray& query,
-                          std::size_t k, std::size_t ef) {
+                          std::size_t k, std::size_t ef, bool use_router) {
             const float* q = as_vector(query, self.dim(), "search");
             py::gil_scoped_release unlock;
-            return self.search(q, k, ef);
+            return self.search(q, k, ef, use_router);
         }, py::arg("query"), py::arg("k") = 10, py::arg("ef") = 0,
+           py::arg("use_router") = false,
            "Approximate search. ef is the beam width — the quality knob.\n"
-           "Raising it must never lower recall. 0 uses the index default.")
+           "Raising it must never lower recall. 0 uses the index default.\n\n"
+           "use_router=True replaces the hierarchical descent with the loaded\n"
+           "router's entry points. Same graph, same seed, one variable — so a\n"
+           "difference is attributable to routing and nothing else.")
 
         .def("search_filtered", [](const HnswIndex& self, const FloatArray& query,
                                    std::size_t k,
                                    const std::vector<std::int64_t>& allowed,
-                                   std::size_t ef) {
+                                   std::size_t ef, bool use_router) {
             const float* q = as_vector(query, self.dim(), "search_filtered");
             py::gil_scoped_release unlock;
-            return self.search_filtered(q, k, allowed, ef);
+            return self.search_filtered(q, k, allowed, ef, use_router);
         }, py::arg("query"), py::arg("k"), py::arg("allowed"), py::arg("ef") = 0,
+           py::arg("use_router") = false,
            "Search restricted to `allowed` ids.\n\n"
            "Non-matching nodes are traversed *through* but never collected —\n"
            "skipping them would disconnect the graph. Cost is therefore about\n"
@@ -154,7 +212,7 @@ PYBIND11_MODULE(_hnsw, m) {
            "Where those cross is what the query planner has to predict.")
 
         .def("search_batch", [](const HnswIndex& self, const FloatArray& queries,
-                                std::size_t k, std::size_t ef) {
+                                std::size_t k, std::size_t ef, bool use_router) {
             require_matrix(queries, self.dim(), "search_batch");
             const auto nq = static_cast<std::size_t>(queries.shape(0));
             const std::size_t width = std::min(k, self.size());
@@ -168,7 +226,8 @@ PYBIND11_MODULE(_hnsw, m) {
             {
                 py::gil_scoped_release unlock;
                 for (std::size_t i = 0; i < nq; ++i) {
-                    const std::vector<Neighbor> found = self.search(q + i * dim, width, ef);
+                    const std::vector<Neighbor> found =
+                        self.search(q + i * dim, width, ef, use_router);
                     for (std::size_t j = 0; j < width; ++j) {
                         // A graph search can return fewer than k when the beam
                         // runs dry; pad so the array stays rectangular, using
@@ -186,9 +245,28 @@ PYBIND11_MODULE(_hnsw, m) {
             }
             return py::make_tuple(ids, scores);
         }, py::arg("queries"), py::arg("k") = 10, py::arg("ef") = 0,
+           py::arg("use_router") = false,
            "Search many queries. Returns (ids, scores) as\n"
            "(n_queries, min(k, len(index))) arrays. Short rows are padded with\n"
            "id -1, which recall_at_k treats as a miss.")
+
+        .def("set_router", &HnswIndex::set_router, py::arg("router"),
+             "Attach a trained router. Raises ValueError if it was trained for\n"
+             "a different dimensionality or a larger corpus.")
+        .def("clear_router", &HnswIndex::clear_router)
+        .def("router", &HnswIndex::router, py::return_value_policy::reference_internal)
+        .def_property_readonly("has_router", &HnswIndex::has_router)
+        .def_property("router_top_p", &HnswIndex::router_top_p,
+                      &HnswIndex::set_router_top_p,
+                      "How many clusters' medoids seed the beam. More entry\n"
+                      "points cost distance computations but give the search\n"
+                      "several places to start when the router is unsure.")
+        .def_property("router_keeps_global_entry",
+                      &HnswIndex::router_keeps_global_entry,
+                      &HnswIndex::set_router_keeps_global_entry,
+                      "Also seed with the graph's own entry point. One extra\n"
+                      "distance computation as insurance against a badly\n"
+                      "routed query.")
 
         .def("vector_at", [](const HnswIndex& self, std::int64_t id) {
             const float* v = self.vector_at(id);
@@ -214,6 +292,12 @@ PYBIND11_MODULE(_hnsw, m) {
         .def_property_readonly("last_visited", &HnswIndex::last_visited,
                                "Nodes scored by the most recent search — the\n"
                                "number that explains why a graph beats a scan.")
+        .def_property_readonly("last_routing_visited",
+                               &HnswIndex::last_routing_visited,
+                               "Of those, how many were spent just getting to\n"
+                               "layer 0: the hierarchy walk, or 0 when a router\n"
+                               "supplied the entry points. This is the work the\n"
+                               "router is trying to eliminate.")
         .def_property("ef_search", &HnswIndex::ef_search, &HnswIndex::set_ef_search,
                       "Default beam width when a search does not name one.")
         .def_property("use_heuristic", &HnswIndex::uses_heuristic,
