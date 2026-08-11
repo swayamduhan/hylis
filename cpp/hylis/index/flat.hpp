@@ -58,22 +58,12 @@
 #include <string>
 #include <vector>
 
+// Metric, Neighbor, the scoring loop and the bounded top-k heap are shared
+// with the HNSW index — see the header for why one implementation matters
+// when the two are benchmarked against each other.
+#include "index/distance.hpp"
+
 namespace hylis::index {
-
-enum class Metric {
-    L2,            // Euclidean distance; smaller is nearer
-    InnerProduct,  // dot product; larger is more similar
-    Cosine,        // inner product on normalised vectors; larger is similar
-};
-
-// One search result. `score` means whichever quantity the index's metric
-// measures: a Euclidean distance for L2, a dot product for InnerProduct, a
-// cosine similarity in [-1, 1] for Cosine. Results are always ordered best
-// first regardless of which of those it is.
-struct Neighbor {
-    std::int64_t id;
-    float score;
-};
 
 class FlatIndex {
 public:
@@ -184,117 +174,23 @@ public:
     }
 
 private:
-    // Bounded max-heap of the best k seen so far, worst at the top.
-    //
-    // The alternative — score all n, then sort — costs O(n) memory and
-    // O(n log n). This costs O(k), and once the heap is full the common case
-    // is a single comparison that rejects the candidate outright, because
-    // most of a corpus is nowhere near any given query.
-    class TopK {
-    public:
-        explicit TopK(std::size_t k) : k_(k) { heap_.reserve(k); }
-
-        void offer(std::int64_t id, float score) {
-            if (heap_.size() < k_) {
-                heap_.push_back({id, score});
-                std::push_heap(heap_.begin(), heap_.end(), worse_last);
-                return;
-            }
-            // heap_.front() is the worst kept so far; a candidate that is not
-            // strictly better than it cannot enter.
-            if (!better(score, id, heap_.front().score, heap_.front().id)) return;
-            std::pop_heap(heap_.begin(), heap_.end(), worse_last);
-            heap_.back() = {id, score};
-            std::push_heap(heap_.begin(), heap_.end(), worse_last);
-        }
-
-        // Empties the heap into a best-first vector.
-        std::vector<Neighbor> drain() {
-            std::sort_heap(heap_.begin(), heap_.end(), worse_last);
-            return std::move(heap_);
-        }
-
-    private:
-        // Total order over candidates: lower score wins, ties go to lower id.
-        static bool better(float sa, std::int64_t ia, float sb, std::int64_t ib) {
-            if (sa != sb) return sa < sb;
-            return ia < ib;
-        }
-
-        // Comparator for the heap: "a is better than b", which puts the worst
-        // element at the top, and — via sort_heap — leaves the range sorted
-        // best-first.
-        static bool worse_last(const Neighbor& a, const Neighbor& b) {
-            return better(a.score, a.id, b.score, b.id);
-        }
-
-        std::size_t k_;
-        std::vector<Neighbor> heap_;
-    };
-
-    // Internal scores are always "smaller is better". Undo that for the
-    // metrics whose natural reading is the other way round, and finish the
-    // square root L2 deferred.
     std::vector<Neighbor> finish(TopK& top) const {
-        std::vector<Neighbor> out = top.drain();
-        for (Neighbor& n : out) {
-            if (metric_ == Metric::L2) {
-                n.score = std::sqrt(std::max(n.score, 0.0f));
-            } else {
-                n.score = -n.score;
-            }
-        }
-        return out;
+        return top.drain_presented(metric_);
     }
 
     const float* prepare_query(const float* query, std::vector<float>& scratch) const {
         if (metric_ != Metric::Cosine) return query;
         scratch.assign(query, query + dim_);
-        normalise(scratch.data());
+        normalise(scratch.data(), dim_);
         return scratch.data();
     }
 
     float score_row(const float* q, std::size_t row) const {
-        const float* b = data_.data() + row * dim_;
-        if (metric_ == Metric::L2) {
-            // Computed directly as sum((q-b)^2) rather than expanded into
-            // |q|^2 - 2q.b + |b|^2. The expansion is faster because it can be
-            // written as a matrix product, but it subtracts two large similar
-            // numbers and loses precision exactly where it matters — among
-            // near neighbours, whose distances are the small ones. The
-            // oracle in python/hylis/datasets.py uses the expanded form, so
-            // the two agreeing is a meaningful cross-check.
-            float acc = 0.0f;
-            for (std::size_t i = 0; i < dim_; ++i) {
-                const float d = q[i] - b[i];
-                acc += d * d;
-            }
-            return acc;
-        }
-        float dot = 0.0f;
-        for (std::size_t i = 0; i < dim_; ++i) dot += q[i] * b[i];
-        return -dot;  // negated so that smaller stays better
+        return score_vectors(q, data_.data() + row * dim_, dim_, metric_);
     }
 
-    void normalise_row(std::size_t row) { normalise(data_.data() + row * dim_); }
-
-    void normalise(float* v) const {
-        float sq = 0.0f;
-        for (std::size_t i = 0; i < dim_; ++i) sq += v[i] * v[i];
-        // A zero vector has no direction. Leaving it at zero makes it equally
-        // (dis)similar to everything, which is the least surprising answer;
-        // dividing would produce NaN and poison every comparison it touches.
-        if (sq <= 0.0f) return;
-        // Divide rather than multiply by a precomputed reciprocal. The
-        // reciprocal is the usual trick and saves dim-1 divisions, but it
-        // rounds twice where dividing rounds once, and the error lands
-        // exactly where it does the most damage: unit-length vectors come
-        // out as 0.99999994 instead of 1.0, so vectors that should tie at
-        // similarity 1 no longer do, and the tie-break stops being
-        // deterministic. Normalisation happens once per vector, so the
-        // divisions cost nothing measurable.
-        const float norm = std::sqrt(sq);
-        for (std::size_t i = 0; i < dim_; ++i) v[i] /= norm;
+    void normalise_row(std::size_t row) {
+        normalise(data_.data() + row * dim_, dim_);
     }
 
     void require_dim(std::size_t got) const {

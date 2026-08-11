@@ -23,6 +23,12 @@ from hylis.index import (  # noqa: F401
     measure_plan,
 )
 from hylis.storage import Record, RecordStore  # noqa: F401
-from hylis.vector import FlatIndex, Metric, Neighbor  # noqa: F401
+from hylis.vector import (  # noqa: F401
+    FlatIndex,
+    HnswIndex,
+    HnswStats,
+    Metric,
+    Neighbor,
+)
 
 __version__ = "0.1.0"

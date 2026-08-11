@@ -31,7 +31,7 @@ except ImportError:
     raise SystemExit("needs numpy: pip install -r requirements.txt")
 
 try:
-    from hylis import FlatIndex, Metric
+    from hylis import FlatIndex, HnswIndex, Metric
     from hylis import datasets as ds
 except ImportError as exc:  # pragma: no cover - depends on the build having run
     raise SystemExit(
@@ -71,6 +71,12 @@ HELP = """
     query <i> [k]           use query vector i from the loaded dataset
     filter <sel> [k] [i]    filtered search keeping a `sel` fraction (0-1)
 
+  index selection  (both stay built; the exact scan is the graph's oracle)
+    index flat|hnsw         which index answers queries
+    hnsw [M] [efC]          (re)build the graph
+    ef <n>                  HNSW beam width; 0 for the index default
+    compare [k] [nq]        same queries both ways: recall vs speed
+
   verify and measure
     check [k]               diff every dataset query against the numpy oracle
     truth [k]               compare against the corpus's *published* ground truth
@@ -82,18 +88,33 @@ HELP = """
 class Playground:
     def __init__(self, dim: int = 0, metric: Metric = Metric.L2) -> None:
         self.metric = metric
-        self.index: FlatIndex | None = None
+        # Both indexes are kept over the same vectors, not one or the other.
+        # The exact scan is the oracle the graph's recall is measured against,
+        # and it is genuinely the faster plan once a selective filter has cut
+        # the candidate set down — so `compare` can run a query both ways.
+        self.flat: FlatIndex | None = None
+        self.hnsw: HnswIndex | None = None
+        self.kind = "flat"
+        self.ef = 0                              # 0 = the index default
         self.base: np.ndarray | None = None      # mirror, for the oracle
         self.queries: np.ndarray | None = None
         self.published_gt: np.ndarray | None = None
         self.source = "(empty)"
+        self.hnsw_build_seconds = 0.0
         if dim:
             self._reset(dim)
+
+    @property
+    def index(self):
+        """Whichever index `kind` currently selects."""
+        return self.hnsw if self.kind == "hnsw" else self.flat
 
     # -- loading ----------------------------------------------------------
 
     def _reset(self, dim: int) -> None:
-        self.index = FlatIndex(dim, self.metric)
+        self.flat = FlatIndex(dim, self.metric)
+        self.hnsw = None
+        self.hnsw_build_seconds = 0.0
         self.base = np.empty((0, dim), dtype=np.float32)
 
     def _install(self, vectors: np.ndarray, source: str,
@@ -106,8 +127,8 @@ class Playground:
 
         self._reset(vectors.shape[1])
         start = time.perf_counter()
-        self.index.reserve(len(vectors))
-        self.index.add_batch(vectors)
+        self.flat.reserve(len(vectors))
+        self.flat.add_batch(vectors)
         elapsed = time.perf_counter() - start
 
         self.base = vectors
@@ -116,7 +137,44 @@ class Playground:
         self.source = source
         print(f"  loaded {source}: {len(vectors):,} x {vectors.shape[1]}-d "
               f"in {elapsed*1000:.0f} ms")
+        if self.kind == "hnsw":
+            self.build_hnsw()
         self.stats()
+
+    def build_hnsw(self, m: int = 16, ef_construction: int = 200) -> None:
+        """Build the graph over whatever is currently loaded.
+
+        Kept lazy because it costs seconds where the flat index costs
+        milliseconds — that asymmetry is itself part of the tradeoff.
+        """
+        if self.base is None or not len(self.base):
+            print("  nothing loaded; try `sift` or `random 5000`")
+            return
+        start = time.perf_counter()
+        graph = HnswIndex(self.base.shape[1], self.metric, M=m,
+                          ef_construction=ef_construction)
+        graph.reserve(len(self.base))
+        graph.add_batch(self.base)
+        self.hnsw_build_seconds = time.perf_counter() - start
+        self.hnsw = graph
+        s = graph.stats()
+        print(f"  built HNSW (M={m}, efC={ef_construction}) in "
+              f"{self.hnsw_build_seconds*1000:.0f} ms")
+        print(f"    {s.levels} levels, population {s.layer_population}")
+        print(f"    mean degree at layer 0 = {s.mean_degree_l0:.1f}, "
+              f"{s.reachable:,}/{s.nodes:,} reachable")
+        print(f"    graph adds {s.graph_bytes/1e6:.1f} MB on top of the vectors")
+
+    def set_kind(self, kind: str) -> None:
+        if kind not in ("flat", "hnsw"):
+            print(f"  unknown index {kind!r}; use `flat` or `hnsw`")
+            return
+        if kind == "hnsw" and self.hnsw is None:
+            self.build_hnsw()
+            if self.hnsw is None:
+                return
+        self.kind = kind
+        print(f"  queries now use the {kind} index")
 
     def load_random(self, n: int, dim: int = 64) -> None:
         v = ds.random_vectors(n=n, dim=dim, n_queries=min(50, n), seed=0,
@@ -183,18 +241,28 @@ class Playground:
             return False
         return True
 
+    def _search(self, index, query: np.ndarray, k: int,
+                allowed: list[int] | None = None):
+        """Run one search on a specific index, honouring ef where it applies."""
+        is_graph = index is self.hnsw
+        if allowed is None:
+            return index.search(query, k, self.ef) if is_graph else index.search(query, k)
+        if is_graph:
+            return index.search_filtered(query, k, allowed, self.ef)
+        return index.search_filtered(query, k, allowed)
+
     def _report(self, label: str, query: np.ndarray, k: int,
                 allowed: list[int] | None = None) -> None:
         start = time.perf_counter()
-        if allowed is None:
-            found = self.index.search(query, k)
-        else:
-            found = self.index.search_filtered(query, k, allowed)
+        found = self._search(self.index, query, k, allowed)
         elapsed = time.perf_counter() - start
 
-        scanned = len(self.index) if allowed is None else len(allowed)
-        print(f"  {label} -> {len(found)} result(s) in {elapsed*1e6:.0f} us "
-              f"({scanned:,} vectors scanned)")
+        if self.kind == "hnsw":
+            scanned = self.hnsw.last_visited
+        else:
+            scanned = len(self.index) if allowed is None else len(allowed)
+        print(f"  [{self.kind}] {label} -> {len(found)} result(s) in "
+              f"{elapsed*1e6:.0f} us ({scanned:,} vectors scanned)")
         unit = "distance" if self.metric == Metric.L2 else "similarity"
         for rank, n in enumerate(found):
             print(f"    {rank:>3}. id {n.id:<8} {unit} {n.score:.6f}")
@@ -346,18 +414,78 @@ class Playground:
     # -- misc -------------------------------------------------------------
 
     def stats(self) -> None:
-        if self.index is None:
+        if self.flat is None:
             print("  no index yet")
             return
-        n = len(self.index)
+        n = len(self.flat)
         print(f"  source  {self.source}")
-        print(f"  size    {n:,} vectors x {self.index.dim} dims")
+        print(f"  size    {n:,} vectors x {self.flat.dim} dims")
         print(f"  metric  {METRIC_NAMES[self.metric]}")
-        print(f"  memory  {n * self.index.dim * 4 / 1e6:.1f} MB "
+        print(f"  active  {self.kind}" + (f"  (ef={self.ef or 'default'})"
+                                          if self.kind == "hnsw" else ""))
+        print(f"  memory  {n * self.flat.dim * 4 / 1e6:.1f} MB "
               f"(float32, one contiguous block)")
+        if self.hnsw is not None:
+            s = self.hnsw.stats()
+            print(f"  hnsw    {s.levels} levels, +{s.graph_bytes/1e6:.1f} MB graph, "
+                  f"{s.reachable:,}/{s.nodes:,} reachable, "
+                  f"built in {self.hnsw_build_seconds*1000:.0f} ms")
+        else:
+            print("  hnsw    not built (`hnsw` or `index hnsw` to build it)")
         if self.queries is not None:
             print(f"  queries {len(self.queries)}"
                   f"{'  (+ published ground truth)' if self.published_gt is not None else ''}")
+
+    def compare(self, k: int = 10, n_queries: int = 50) -> None:
+        """Run the same queries through both indexes and show the tradeoff.
+
+        This is the whole point of keeping both: the exact scan gives the
+        answer, the graph gives an answer, and the interesting question is how
+        much accuracy the speed cost.
+        """
+        if not self._require():
+            return
+        if self.hnsw is None:
+            self.build_hnsw()
+            if self.hnsw is None:
+                return
+
+        queries = self.queries
+        if queries is None:
+            rng = np.random.default_rng(0)
+            pick = rng.choice(len(self.base), size=min(n_queries, len(self.base)),
+                              replace=False)
+            queries = self.base[pick]
+        queries = queries[:n_queries]
+
+        start = time.perf_counter()
+        exact = [self.flat.search(q, k) for q in queries]
+        flat_us = (time.perf_counter() - start) / len(queries) * 1e6
+
+        print(f"  {len(queries)} queries, k={k}, over {len(self.flat):,} vectors")
+        print(f"    {'ef':>6}{'recall':>10}{'us/query':>11}{'visited':>10}{'speedup':>10}")
+        efs = [self.ef] if self.ef else [10, 20, 50, 100, 200]
+        for ef in efs:
+            start = time.perf_counter()
+            approx = [self.hnsw.search(q, k, ef) for q in queries]
+            graph_us = (time.perf_counter() - start) / len(queries) * 1e6
+
+            visited = []
+            for q in queries[:10]:
+                self.hnsw.search(q, k, ef)
+                visited.append(self.hnsw.last_visited)
+
+            hits = 0
+            for got, want in zip(approx, exact):
+                truth = {n.id for n in want}
+                hits += sum(1 for n in got if n.id in truth)
+            recall = hits / max(sum(len(r) for r in exact), 1)
+
+            print(f"    {ef:>6}{recall:>10.4f}{graph_us:>11.0f}"
+                  f"{np.mean(visited):>10,.0f}{flat_us/graph_us:>9.1f}x")
+
+        print(f"    {'flat':>6}{1.0:>10.4f}{flat_us:>11.0f}"
+              f"{len(self.flat):>10,}{'1.0x':>10}   <- exact, by definition")
 
     def set_metric(self, name: str) -> None:
         if name not in METRICS:
@@ -371,13 +499,13 @@ class Playground:
             print(f"  metric set to {name}")
 
     def clear(self) -> None:
-        if self.index is not None:
-            self.index.clear()
+        self.flat = None
+        self.hnsw = None
         self.base = None
         self.queries = None
         self.published_gt = None
-        self.index = None
         self.source = "(empty)"
+        self.hnsw_build_seconds = 0.0
         print("  cleared")
 
 
@@ -441,6 +569,20 @@ def dispatch(pg: Playground, line: str) -> bool:
                      int(args[1]) if len(args) > 1 else 10)
         elif cmd in ("stats", "s"):
             pg.stats()
+        elif cmd == "index":
+            pg.set_kind(args[0].lower())
+        elif cmd == "hnsw":
+            pg.build_hnsw(int(args[0]) if args else 16,
+                          int(args[1]) if len(args) > 1 else 200)
+            pg.kind = "hnsw"
+        elif cmd == "flat":
+            pg.set_kind("flat")
+        elif cmd == "ef":
+            pg.ef = max(0, int(args[0]))
+            print(f"  ef = {pg.ef or 'index default'}")
+        elif cmd == "compare":
+            pg.compare(int(args[0]) if args else 10,
+                       int(args[1]) if len(args) > 1 else 50)
         elif cmd == "metric":
             pg.set_metric(args[0].lower())
         elif cmd == "clear":

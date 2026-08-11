@@ -123,6 +123,41 @@ def test_bad_input_does_not_crash():
     assert "recall 1.0000" in out
 
 
+def test_both_indexes_answer_the_same_query():
+    """The standing requirement: a user can run a query both ways and see how
+    they compare, rather than being handed one index and told to trust it."""
+    out = run(["--random", "2000x16"],
+              stdin="hnsw\nknn 0 5\nindex flat\nknn 0 5\nstats\nquit\n")
+    assert "[hnsw]" in out
+    assert "[flat]" in out
+    assert "reachable" in out
+
+
+def test_compare_reports_recall_against_the_exact_index():
+    out = run(["--random", "2000x16"], stdin="compare 10 20\nquit\n")
+    assert "exact, by definition" in out
+    # The last row is the flat index and must be exact.
+    assert "1.0000" in out
+
+
+def test_ef_is_settable_and_affects_the_search():
+    out = run(["--random", "1500x16"],
+              stdin="hnsw\nef 10\nstats\nef 200\ncompare 10 20\nquit\n")
+    assert "ef = 10" in out
+    assert "ef = 200" in out
+
+
+def test_building_the_graph_reports_its_shape():
+    out = run(["--random", "3000x16"], stdin="hnsw 8 100\nstats\nquit\n")
+    assert "levels" in out
+    assert "mean degree at layer 0" in out
+
+
+def test_unknown_index_kind_is_reported():
+    out = run(["--random", "500x8"], stdin="index bogus\nquit\n")
+    assert "unknown index" in out
+
+
 def test_benchmarks_flag_an_unoptimised_build():
     """The guard itself must work, whichever way this build was compiled."""
     sys.path.insert(0, str(REPO_ROOT / "python"))

@@ -55,3 +55,7 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rmi.cpp")
     hylis_add_binding(_rmi rmi.cpp)
 endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hnsw.cpp")
+    hylis_add_binding(_hnsw hnsw.cpp)
+endif()

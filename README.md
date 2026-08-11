@@ -19,7 +19,7 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 | 2 | B+ Tree             | ✅ |
 | 3 | Brute-force vector  | ✅ |
 | 4 | Learned Index (RMI) | ✅ |
-| 5 | HNSW baseline       | ☐ |
+| 5 | HNSW baseline       | ✅ |
 | 6 | Neural Router       | ☐ |
 | 7 | Incremental retrain | ☐ |
 | 8 | Query planner       | ☐ |
@@ -32,8 +32,8 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 cpp/
   hylis/
     storage/    # record store + write-ahead log (header-only)
-    index/      # B+ tree, flat vector index, RMI, per-column selection
-  bindings/     # pybind11 -> hylis._storage, _btree, _flat, _rmi
+    index/      # B+ tree, RMI, per-column selection, flat + HNSW vector search
+  bindings/     # pybind11 -> hylis._storage, _btree, _flat, _rmi, _hnsw
   tests/        # GoogleTest suites for the C++ core
 python/hylis/   # user-facing Python API; built extensions land here
   datasets.py   # data generators + loaders + the brute-force oracle
@@ -114,23 +114,59 @@ milliseconds while producing a plan means re-measuring everything. Each plan
 carries a fingerprint of the data it was chosen for, so a stale plan is
 detected and re-tuned; it can only ever cost speed, never correctness.
 
-## Trying the vector index
+## Vector search: exact and approximate
+
+Two indexes over the same vectors, both kept in the final build.
+
+`FlatIndex` scans everything, so it is exact by construction — the oracle
+HNSW's recall is measured against, and the baseline its speedups are quoted
+from. `HnswIndex` is a hierarchical proximity graph (Malkov & Yashunin, 2018):
+a random layer assignment builds sparse upper layers that act as a highway
+over the data, and the search descends through them before doing fine-grained
+work at layer 0.
 
 ```bash
-python scripts/try_vectors.py --demo       # scripted walkthrough
-python scripts/try_vectors.py --sift       # real SIFT10K
-python scripts/try_vectors.py --random 5000x64 --metric cosine
-python scripts/try_vectors.py --npy mine.npy
+python scripts/bench_vector.py             # recall/QPS curve + filtered crossover
+python scripts/try_vectors.py --sift       # then: hnsw, compare, index flat
 ```
 
-`check` diffs every result against the numpy oracle, `truth` against SIFT's
-published neighbour lists, and `filter <selectivity>` runs the same query
-both ways — pre-filter and post-filter — reporting how many vectors each
-plan had to touch. That gap is what the query planner exists to exploit.
+Measured on SIFT10K (M=16, efConstruction=200):
 
-`FlatIndex` stays in the final build alongside HNSW rather than being
-replaced by it: it is the exactness oracle, the baseline, and genuinely the
-cheaper plan once a selective predicate has cut the candidate set down.
+```
+index      ef   recall@10        QPS   visited   speedup
+flat        -      1.0000      2,531    10,000     1.00x
+hnsw       10      0.8840     47,128       252    18.6x
+hnsw       20      0.9630     32,508       363    12.8x
+hnsw       40      0.9980     19,214       560     7.6x
+hnsw       80      1.0000     13,845       868     5.5x
+```
+
+**ef=20 clears 0.95 recall at 12.8× the throughput of an exhaustive scan**,
+touching 363 of 10,000 vectors. Layer populations come out
+`[10000, 598, 38, 5, 1]` — the ~1/M decay the algorithm depends on — for 27%
+memory overhead on top of the raw vectors.
+
+Three things worth knowing:
+
+**The selection heuristic is the whole algorithm.** Keeping a node's M
+*nearest* candidates fills its links with mutual near-duplicates and leaves
+no way out of its own cluster. The paper's Algorithm 4 instead drops a
+candidate that is closer to an already-chosen neighbour than to the node
+itself, preserving long-range edges. `use_heuristic = False` switches it off
+so the difference is measurable rather than asserted.
+
+**Full reachability is not guaranteed.** Links are added bidirectionally, but
+pruning a full neighbour list can drop the back-link — and a node whose every
+in-edge is pruned can never be returned, whatever ef is. At M=16 reachability
+is 100%; at M=2 it strands ~5% of nodes. So it is reported by `reachable()`
+as a statistic, not asserted by `validate()`.
+
+**Filtered search crosses over at ~50% selectivity.** Filtered brute force is
+`O(|allowed|)` and exact, so it gets cheaper as a predicate tightens. The
+graph must traverse non-matching nodes to stay connected, so it gets more
+expensive — at 0.1% selectivity it visits all 10,004 nodes and takes 1502 µs
+against brute force's 3 µs. Below ~50% selectivity the exhaustive scan wins
+outright. That crossover is precisely what the query planner has to predict.
 
 ## Trying the B+ tree
 

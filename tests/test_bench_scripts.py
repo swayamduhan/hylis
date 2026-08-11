@@ -95,9 +95,53 @@ def test_stage1_experiment_runs_both_families():
     assert "busiest" in out
 
 
+def test_bench_vector_produces_a_recall_curve():
+    proc, out = run("bench_vector.py",
+                    ["--random", "3000x16", "--skip-filtered"])
+    if not optimised():
+        assert proc.returncode != 0
+        assert "meaningless" in out
+        return
+    assert proc.returncode == 0, out
+    assert "recall@10" in out
+    assert "hnsw" in out and "flat" in out
+
+
+def test_bench_vector_recall_rises_with_ef():
+    """Parse the curve rather than trusting that it printed one.
+
+    ef is the quality knob and monotonicity is the property users rely on; a
+    benchmark that silently printed a non-monotonic curve would be reporting
+    a bug as a result.
+    """
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("bench_vector.py", ["--random", "3000x16", "--skip-filtered"])
+    assert proc.returncode == 0, out
+
+    recalls = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[0] == "hnsw":
+            recalls.append(float(parts[2]))
+
+    assert len(recalls) >= 4, out
+    assert recalls == sorted(recalls), f"recall fell as ef rose: {recalls}"
+    assert recalls[-1] > 0.95
+
+
+def test_bench_vector_filtered_crossover_runs():
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("bench_vector.py", ["--random", "4000x16"])
+    assert proc.returncode == 0, out
+    assert "selectivity" in out
+    assert "flat" in out and "hnsw" in out
+
+
 def test_scripts_report_their_own_usage():
     for script in ("bench_index.py", "experiment_curvature.py",
-                   "experiment_stage1.py"):
+                   "experiment_stage1.py", "bench_vector.py"):
         proc, out = run(script, ["--help"])
         assert proc.returncode == 0, out
         assert "usage:" in out.lower()
