@@ -10,3 +10,6 @@ plans
 
 # Benchmark corpora: large, immutable, re-downloadable (scripts/fetch_data.py)
 data/
+
+# pip install -e . metadata; regenerated on every install
+*.egg-info/
