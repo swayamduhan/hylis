@@ -158,6 +158,44 @@ def test_unknown_index_kind_is_reported():
     assert "unknown index" in out
 
 
+def test_all_four_index_kinds_answer_the_same_query():
+    """The standing requirement, now across every implementation: a user can
+    run one query each way and see how they compare."""
+    out = run(["--random", "2000x16"],
+              stdin="hnswlib\nrouter\nindex routed\nknn 0 3\n"
+                    "index hnsw\nknn 0 3\nindex hnswlib\nknn 0 3\n"
+                    "index flat\nknn 0 3\nquit\n")
+    for kind in ("[routed]", "[hnsw]", "[hnswlib]", "[flat]"):
+        assert kind in out, f"{kind} never answered"
+
+
+def test_compare_covers_every_built_index():
+    out = run(["--random", "2000x16"],
+              stdin="hnswlib\nrouter\ncompare 10 20\nquit\n")
+    assert "exact, by definition" in out
+    for kind in ("hnswlib", "hnsw", "routed", "flat"):
+        assert kind in out
+
+
+def test_router_trains_when_none_is_saved(tmp_path):
+    out = run(["--random", "1500x16"],
+              stdin=f"router {tmp_path / 'r.json'}\nindex routed\nknn 0 3\nquit\n")
+    assert "training one now" in out
+    assert "validation accuracy" in out
+    assert "[routed]" in out
+
+
+def test_compare_reports_no_router_rather_than_failing():
+    out = run(["--random", "1000x16"], stdin="hnsw\ncompare 10 10\nquit\n")
+    assert "no router loaded" in out
+
+
+def test_unknown_index_kind_lists_the_options():
+    out = run(["--random", "500x8"], stdin="index bogus\nquit\n")
+    assert "unknown index" in out
+    assert "routed" in out
+
+
 def test_benchmarks_flag_an_unoptimised_build():
     """The guard itself must work, whichever way this build was compiled."""
     sys.path.insert(0, str(REPO_ROOT / "python"))

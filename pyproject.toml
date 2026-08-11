@@ -1,0 +1,43 @@
+# Packaging metadata, so `hylis` is importable from a plain Python prompt.
+#
+# The package lives in python/ rather than at the repo root, which keeps the
+# C++ tree and the Python tree side by side instead of tangled. pytest finds it
+# via conftest.py, and the scripts insert the path themselves — but neither
+# helps at an interactive prompt, which is what this file is for:
+#
+#     pip install -e .
+#     python -c "from hylis import BPlusTree; print(BPlusTree(order=4))"
+#
+# Deliberately *not* a build backend for the C++ side. Compiling the extensions
+# is CMake's job and stays that way; an editable install simply points at
+# python/hylis, where the build already writes the .pyd files. A rebuild is
+# therefore picked up with no reinstall.
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hylis"
+version = "0.1.0"
+description = "Hybrid database indexing: B+ tree, learned index, and neural-routed HNSW"
+requires-python = ">=3.8"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+# The compiled pybind11 extensions are built into the package directory by
+# CMake, so they ship with it rather than being compiled here.
+[tool.setuptools.package-data]
+hylis = ["*.pyd", "*.so", "*.pyi"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["sift: needs the SIFT corpus in data/ (python scripts/fetch_data.py siftsmall)"]

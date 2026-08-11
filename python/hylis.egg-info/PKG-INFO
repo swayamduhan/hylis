@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: hylis
+Version: 0.1.0
+Summary: Hybrid database indexing: B+ tree, learned index, and neural-routed HNSW
+Requires-Python: >=3.8
+Requires-Dist: numpy>=1.24
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"

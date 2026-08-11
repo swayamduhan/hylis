@@ -33,6 +33,9 @@ except ImportError:
 try:
     from hylis import FlatIndex, HnswIndex, Metric
     from hylis import datasets as ds
+    from hylis._hnsw import NeuralRouter
+    from hylis.router import RouterMLP, build_training_set, kmeans, router_json
+    import hylis._hnswlib as hnswlib_module
 except ImportError as exc:  # pragma: no cover - depends on the build having run
     raise SystemExit(
         f"cannot import hylis ({exc}).\n"
@@ -71,11 +74,14 @@ HELP = """
     query <i> [k]           use query vector i from the loaded dataset
     filter <sel> [k] [i]    filtered search keeping a `sel` fraction (0-1)
 
-  index selection  (both stay built; the exact scan is the graph's oracle)
-    index flat|hnsw         which index answers queries
-    hnsw [M] [efC]          (re)build the graph
-    ef <n>                  HNSW beam width; 0 for the index default
-    compare [k] [nq]        same queries both ways: recall vs speed
+  index selection  (all stay built; the exact scan is everyone's oracle)
+    index flat|hnsw|hnswlib|routed
+                            which index answers queries
+    hnsw [M] [efC]          (re)build our graph
+    hnswlib [M] [efC]       build the reference implementation
+    router [path]           load a trained router, or train one now
+    ef <n>                  beam width; 0 for the index default
+    compare [k] [nq]        every index, same queries: recall vs speed
 
   verify and measure
     check [k]               diff every dataset query against the numpy oracle
@@ -85,15 +91,21 @@ HELP = """
 """
 
 
+KINDS = ("flat", "hnsw", "hnswlib", "routed")
+
+
 class Playground:
     def __init__(self, dim: int = 0, metric: Metric = Metric.L2) -> None:
         self.metric = metric
-        # Both indexes are kept over the same vectors, not one or the other.
-        # The exact scan is the oracle the graph's recall is measured against,
-        # and it is genuinely the faster plan once a selective filter has cut
-        # the candidate set down — so `compare` can run a query both ways.
+        # Every index is kept over the same vectors, not one or the other. The
+        # exact scan is the oracle the approximate ones are graded against;
+        # hnswlib is the external reference that says whether ours is
+        # competitive; `routed` is the same graph as `hnsw` with the neural
+        # router supplying entry points, so comparing those two isolates
+        # routing and nothing else.
         self.flat: FlatIndex | None = None
         self.hnsw: HnswIndex | None = None
+        self.hnswlib = None
         self.kind = "flat"
         self.ef = 0                              # 0 = the index default
         self.base: np.ndarray | None = None      # mirror, for the oracle
@@ -101,20 +113,38 @@ class Playground:
         self.published_gt: np.ndarray | None = None
         self.source = "(empty)"
         self.hnsw_build_seconds = 0.0
+        self.hnswlib_build_seconds = 0.0
+        self.router_note = "none"
         if dim:
             self._reset(dim)
 
     @property
     def index(self):
-        """Whichever index `kind` currently selects."""
-        return self.hnsw if self.kind == "hnsw" else self.flat
+        """Whichever index `kind` currently selects.
+
+        `hnsw` and `routed` are the *same object* — they differ only in whether
+        search is told to use the router, which is the whole point of the
+        controlled comparison.
+        """
+        if self.kind == "hnswlib":
+            return self.hnswlib
+        if self.kind in ("hnsw", "routed"):
+            return self.hnsw
+        return self.flat
+
+    @property
+    def uses_router(self) -> bool:
+        return self.kind == "routed"
 
     # -- loading ----------------------------------------------------------
 
     def _reset(self, dim: int) -> None:
         self.flat = FlatIndex(dim, self.metric)
         self.hnsw = None
+        self.hnswlib = None
         self.hnsw_build_seconds = 0.0
+        self.hnswlib_build_seconds = 0.0
+        self.router_note = "none"
         self.base = np.empty((0, dim), dtype=np.float32)
 
     def _install(self, vectors: np.ndarray, source: str,
@@ -137,7 +167,7 @@ class Playground:
         self.source = source
         print(f"  loaded {source}: {len(vectors):,} x {vectors.shape[1]}-d "
               f"in {elapsed*1000:.0f} ms")
-        if self.kind == "hnsw":
+        if self.kind in ("hnsw", "routed"):
             self.build_hnsw()
         self.stats()
 
@@ -165,13 +195,102 @@ class Playground:
               f"{s.reachable:,}/{s.nodes:,} reachable")
         print(f"    graph adds {s.graph_bytes/1e6:.1f} MB on top of the vectors")
 
-    def set_kind(self, kind: str) -> None:
-        if kind not in ("flat", "hnsw"):
-            print(f"  unknown index {kind!r}; use `flat` or `hnsw`")
+    def build_hnswlib(self, m: int = 16, ef_construction: int = 200) -> None:
+        """Build the reference implementation over the same vectors."""
+        if not hnswlib_module.available:
+            print("  hnswlib was not available when hylis was built.")
+            print("  Reconfigure with -DHYLIS_WITH_HNSWLIB=ON to use it.")
             return
-        if kind == "hnsw" and self.hnsw is None:
+        if self.base is None or not len(self.base):
+            print("  nothing loaded; try `sift` or `random 5000`")
+            return
+        start = time.perf_counter()
+        lib = hnswlib_module.HnswlibIndex(self.base.shape[1], self.metric,
+                                          capacity=len(self.base), M=m,
+                                          ef_construction=ef_construction)
+        lib.add_batch(self.base)
+        self.hnswlib_build_seconds = time.perf_counter() - start
+        self.hnswlib = lib
+        print(f"  built hnswlib (M={m}, efC={ef_construction}) in "
+              f"{self.hnswlib_build_seconds*1000:.0f} ms")
+
+    def _corpus_slug(self) -> str:
+        """Cache key for a trained router.
+
+        Includes the shape, not just the source name: two different `random`
+        corpora would otherwise share a filename, and a router trained for one
+        dimensionality would be offered to the other.
+        """
+        name = "".join(c if c.isalnum() else "-" for c in self.source.split()[0])
+        return f"{name}-{len(self.base)}x{self.base.shape[1]}"
+
+    def load_router(self, path: str | None = None) -> None:
+        """Attach a trained router, training one now if none exists.
+
+        Training is the expensive part — clustering plus a few dozen epochs —
+        so a saved router for this corpus is reused when there is one.
+        """
+        if self.hnsw is None:
             self.build_hnsw()
             if self.hnsw is None:
+                return
+
+        candidate = Path(path) if path else (
+            ds.default_data_dir() / f"router-{self._corpus_slug()}.json")
+        if candidate.exists():
+            try:
+                self.hnsw.set_router(NeuralRouter.load(str(candidate)))
+            except (RuntimeError, ValueError) as exc:
+                # A router trained on a different corpus is useless but not
+                # fatal: say so and train a fresh one rather than leaving the
+                # routed index silently unavailable.
+                print(f"  {candidate.name} does not fit this corpus ({exc})")
+                print("  training a replacement")
+            else:
+                self.router_note = f"loaded from {candidate.name}"
+                print(f"  router loaded from {candidate}")
+                return
+        else:
+            print(f"  no saved router at {candidate}; training one now")
+        print("  (k-means + MLP - this takes a minute on a large corpus)")
+        km = kmeans(self.base, n_clusters=min(256, max(2, len(self.base) // 20)),
+                    seed=0)
+        exact = None
+        if 40_000 * len(self.base) <= 2e9:
+            exact = self.flat
+        ts = build_training_set(self.base, km.assignment, n_samples=40_000,
+                                seed=0, exact_index=exact)
+        model = RouterMLP(dim=self.base.shape[1], clusters=km.centroids.shape[0],
+                          hidden=64, seed=0)
+        start = time.perf_counter()
+        model.fit(ts.x_train, ts.y_train, epochs=25)
+        accuracy = float((model.predict(ts.x_val) == ts.y_val).mean())
+
+        blob = router_json(model, km.medoids)
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_text(blob, encoding="utf-8")
+        self.hnsw.set_router(NeuralRouter.from_json(blob))
+        self.router_note = f"trained here, val acc {accuracy:.3f}"
+        print(f"  trained {km.centroids.shape[0]} clusters in "
+              f"{time.perf_counter()-start:.0f}s, validation accuracy "
+              f"{accuracy:.3f}")
+        print(f"  saved to {candidate}")
+
+    def set_kind(self, kind: str) -> None:
+        if kind not in KINDS:
+            print(f"  unknown index {kind!r}; one of {', '.join(KINDS)}")
+            return
+        if kind in ("hnsw", "routed") and self.hnsw is None:
+            self.build_hnsw()
+            if self.hnsw is None:
+                return
+        if kind == "routed" and not self.hnsw.has_router:
+            self.load_router()
+            if not self.hnsw.has_router:
+                return
+        if kind == "hnswlib" and self.hnswlib is None:
+            self.build_hnswlib()
+            if self.hnswlib is None:
                 return
         self.kind = kind
         print(f"  queries now use the {kind} index")
@@ -242,13 +361,24 @@ class Playground:
         return True
 
     def _search(self, index, query: np.ndarray, k: int,
-                allowed: list[int] | None = None):
-        """Run one search on a specific index, honouring ef where it applies."""
-        is_graph = index is self.hnsw
-        if allowed is None:
-            return index.search(query, k, self.ef) if is_graph else index.search(query, k)
-        if is_graph:
+                allowed: list[int] | None = None, routed: bool | None = None):
+        """Run one search on a specific index, honouring ef where it applies.
+
+        Only our HnswIndex takes a router flag; FlatIndex has no entry point to
+        choose and hnswlib has its own hierarchy we do not reach into.
+        """
+        if routed is None:
+            routed = self.uses_router
+        if index is self.hnsw:
+            if allowed is None:
+                return index.search(query, k, self.ef, routed)
+            return index.search_filtered(query, k, allowed, self.ef, routed)
+        if index is self.hnswlib:
+            if allowed is None:
+                return index.search(query, k, self.ef)
             return index.search_filtered(query, k, allowed, self.ef)
+        if allowed is None:
+            return index.search(query, k)
         return index.search_filtered(query, k, allowed)
 
     def _report(self, label: str, query: np.ndarray, k: int,
@@ -257,12 +387,14 @@ class Playground:
         found = self._search(self.index, query, k, allowed)
         elapsed = time.perf_counter() - start
 
-        if self.kind == "hnsw":
-            scanned = self.hnsw.last_visited
+        if self.kind in ("hnsw", "routed"):
+            scanned = f"{self.hnsw.last_visited:,} visited"
+        elif self.kind == "hnswlib":
+            scanned = "graph traversal"
         else:
-            scanned = len(self.index) if allowed is None else len(allowed)
+            scanned = f"{(len(self.index) if allowed is None else len(allowed)):,} scanned"
         print(f"  [{self.kind}] {label} -> {len(found)} result(s) in "
-              f"{elapsed*1e6:.0f} us ({scanned:,} vectors scanned)")
+              f"{elapsed*1e6:.0f} us ({scanned})")
         unit = "distance" if self.metric == Metric.L2 else "similarity"
         for rank, n in enumerate(found):
             print(f"    {rank:>3}. id {n.id:<8} {unit} {n.score:.6f}")
@@ -273,7 +405,7 @@ class Playground:
         if not 0 <= vid < len(self.index):
             print(f"  id {vid} out of range [0, {len(self.index)})")
             return
-        self._report(f"knn(id={vid}, k={k})", self.index.vector_at(vid), k)
+        self._report(f"knn(id={vid}, k={k})", self.base[vid], k)
 
     def search_typed(self, k: int, values: list[float]) -> None:
         if not self._require():
@@ -422,7 +554,7 @@ class Playground:
         print(f"  size    {n:,} vectors x {self.flat.dim} dims")
         print(f"  metric  {METRIC_NAMES[self.metric]}")
         print(f"  active  {self.kind}" + (f"  (ef={self.ef or 'default'})"
-                                          if self.kind == "hnsw" else ""))
+                                          if self.kind != "flat" else ""))
         print(f"  memory  {n * self.flat.dim * 4 / 1e6:.1f} MB "
               f"(float32, one contiguous block)")
         if self.hnsw is not None:
@@ -430,25 +562,27 @@ class Playground:
             print(f"  hnsw    {s.levels} levels, +{s.graph_bytes/1e6:.1f} MB graph, "
                   f"{s.reachable:,}/{s.nodes:,} reachable, "
                   f"built in {self.hnsw_build_seconds*1000:.0f} ms")
+            print(f"  router  {self.router_note}")
         else:
             print("  hnsw    not built (`hnsw` or `index hnsw` to build it)")
+        if self.hnswlib is not None:
+            print(f"  hnswlib built in {self.hnswlib_build_seconds*1000:.0f} ms "
+                  f"(external baseline)")
         if self.queries is not None:
             print(f"  queries {len(self.queries)}"
                   f"{'  (+ published ground truth)' if self.published_gt is not None else ''}")
 
     def compare(self, k: int = 10, n_queries: int = 50) -> None:
-        """Run the same queries through both indexes and show the tradeoff.
+        """Run the same queries through every available index.
 
-        This is the whole point of keeping both: the exact scan gives the
-        answer, the graph gives an answer, and the interesting question is how
-        much accuracy the speed cost.
+        The whole point of keeping all of them: the exact scan gives the
+        answer, each approximate index gives an answer, and the interesting
+        question is what the speed cost in accuracy. `hnsw` and `routed` share
+        one graph, so the gap between those two rows is routing and nothing
+        else.
         """
         if not self._require():
             return
-        if self.hnsw is None:
-            self.build_hnsw()
-            if self.hnsw is None:
-                return
 
         queries = self.queries
         if queries is None:
@@ -461,31 +595,42 @@ class Playground:
         start = time.perf_counter()
         exact = [self.flat.search(q, k) for q in queries]
         flat_us = (time.perf_counter() - start) / len(queries) * 1e6
+        total_truth = max(sum(len(r) for r in exact), 1)
 
         print(f"  {len(queries)} queries, k={k}, over {len(self.flat):,} vectors")
-        print(f"    {'ef':>6}{'recall':>10}{'us/query':>11}{'visited':>10}{'speedup':>10}")
-        efs = [self.ef] if self.ef else [10, 20, 50, 100, 200]
-        for ef in efs:
-            start = time.perf_counter()
-            approx = [self.hnsw.search(q, k, ef) for q in queries]
-            graph_us = (time.perf_counter() - start) / len(queries) * 1e6
+        print(f"    {'index':<10}{'ef':>6}{'recall':>10}{'us/query':>11}"
+              f"{'visited':>10}{'vs flat':>9}")
 
-            visited = []
-            for q in queries[:10]:
-                self.hnsw.search(q, k, ef)
-                visited.append(self.hnsw.last_visited)
+        def row(name, run, visited_of=None, efs=None):
+            for ef in (efs or ([self.ef] if self.ef else [10, 20, 50, 100, 200])):
+                start = time.perf_counter()
+                got = [run(q, ef) for q in queries]
+                per_query = (time.perf_counter() - start) / len(queries) * 1e6
+                hits = sum(len({n.id for n in g} & {n.id for n in w})
+                           for g, w in zip(got, exact))
+                visited = "-"
+                if visited_of is not None:
+                    samples = []
+                    for q in queries[:10]:
+                        run(q, ef)
+                        samples.append(visited_of())
+                    visited = f"{np.mean(samples):,.0f}"
+                print(f"    {name:<10}{ef:>6}{hits/total_truth:>10.4f}"
+                      f"{per_query:>11.0f}{visited:>10}{flat_us/per_query:>8.1f}x")
 
-            hits = 0
-            for got, want in zip(approx, exact):
-                truth = {n.id for n in want}
-                hits += sum(1 for n in got if n.id in truth)
-            recall = hits / max(sum(len(r) for r in exact), 1)
+        if self.hnswlib is not None:
+            row("hnswlib", lambda q, ef: self.hnswlib.search(q, k, ef))
+        if self.hnsw is not None:
+            row("hnsw", lambda q, ef: self.hnsw.search(q, k, ef, False),
+                lambda: self.hnsw.last_visited)
+            if self.hnsw.has_router:
+                row("routed", lambda q, ef: self.hnsw.search(q, k, ef, True),
+                    lambda: self.hnsw.last_visited)
+            else:
+                print("    routed     -- no router loaded (`router` to train one)")
 
-            print(f"    {ef:>6}{recall:>10.4f}{graph_us:>11.0f}"
-                  f"{np.mean(visited):>10,.0f}{flat_us/graph_us:>9.1f}x")
-
-        print(f"    {'flat':>6}{1.0:>10.4f}{flat_us:>11.0f}"
-              f"{len(self.flat):>10,}{'1.0x':>10}   <- exact, by definition")
+        print(f"    {'flat':<10}{'-':>6}{1.0:>10.4f}{flat_us:>11.0f}"
+              f"{len(self.flat):>10,}{'1.0x':>8}   <- exact, by definition")
 
     def set_metric(self, name: str) -> None:
         if name not in METRICS:
@@ -577,6 +722,15 @@ def dispatch(pg: Playground, line: str) -> bool:
             pg.kind = "hnsw"
         elif cmd == "flat":
             pg.set_kind("flat")
+        elif cmd == "hnswlib":
+            pg.build_hnswlib(int(args[0]) if args else 16,
+                             int(args[1]) if len(args) > 1 else 200)
+            if pg.hnswlib is not None:
+                pg.kind = "hnswlib"
+        elif cmd == "routed":
+            pg.set_kind("routed")
+        elif cmd == "router":
+            pg.load_router(args[0] if args else None)
         elif cmd == "ef":
             pg.ef = max(0, int(args[0]))
             print(f"  ef = {pg.ef or 'index default'}")
@@ -597,6 +751,9 @@ def dispatch(pg: Playground, line: str) -> bool:
 
 DEMO = [
     "random 2000 32",
+    "hnswlib",
+    "router",
+    "compare 10 50",
     "stats",
     "knn 0 5",
     "search 3 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0",

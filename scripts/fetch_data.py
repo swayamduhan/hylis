@@ -68,6 +68,9 @@ DATASETS: dict[str, Dataset] = {
         sentinel="sift/sift_base.fvecs",
         approx_mb=168,
         description="SIFT1M: 1M base / 10k query / 128-d, with ground truth",
+        # Pinned from a download that then parsed to exactly the documented
+        # shape (1000000x128 base, 10000 queries, 10000x100 ground truth).
+        sha256="92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a",
     ),
 }
 

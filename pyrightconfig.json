@@ -1,0 +1,22 @@
+{
+  "//": [
+    "Editor/type-checker configuration. Nothing at runtime reads this.",
+    "",
+    "The hylis package lives in python/, not at the repo root, and pytest",
+    "finds it because conftest.py inserts that directory onto sys.path. A",
+    "static analyser never runs conftest.py, so it needs telling separately —",
+    "otherwise every `from hylis import ...` shows as unresolved in the editor",
+    "while the tests pass perfectly well.",
+    "",
+    "reportMissingModuleSource is off because hylis._storage, _btree, _flat,",
+    "_rmi, _hnsw and _hnswlib are compiled pybind11 extensions (.pyd). The",
+    "modules exist and import fine; there is simply no Python source for a",
+    "type checker to read. Generating stubs would fix autocomplete for them:",
+    "    pip install pybind11-stubgen",
+    "    pybind11-stubgen hylis --output-dir python"
+  ],
+  "extraPaths": ["python"],
+  "exclude": ["build", "data", "plans", "**/__pycache__"],
+  "reportMissingModuleSource": "none",
+  "pythonVersion": "3.8"
+}

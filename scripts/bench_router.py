@@ -127,11 +127,23 @@ def main(argv=None) -> int:
     parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--samples", type=int, default=40_000)
+    parser.add_argument("--queries", type=int, default=0,
+                        help="cap the query set; 0 uses all of it. Worth "
+                             "setting on SIFT1M, where an exhaustive scan of "
+                             "all 10,000 queries costs several minutes on its "
+                             "own and the reference line does not need that "
+                             "many to be stable.")
     args = parser.parse_args(argv)
 
     require_optimised()
     corpus, label = load_corpus(args)
     k = args.k
+
+    if args.queries and args.queries < corpus.n_queries:
+        corpus = ds.VectorDataset(
+            corpus.base, corpus.queries[: args.queries],
+            None if corpus.ground_truth is None else corpus.ground_truth[: args.queries],
+            corpus.name, corpus.metric)
 
     print(f"Four indexes on {label}: {corpus.n:,} x {corpus.dim}-d, "
           f"{corpus.n_queries} queries, k={k}\n")
