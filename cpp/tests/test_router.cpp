@@ -434,3 +434,180 @@ TEST(FlatOnlyGraph, StillAnswersCorrectlyWithoutARouter) {
     }
     EXPECT_GT(static_cast<double>(hits) / (c.n_queries * 10), 0.8);
 }
+
+// -------------------------------------------------- router staleness
+
+namespace {
+
+// A router with a real, spread-out set of medoids, built without training:
+// every cluster c is pointed at node c, and the classifier sends a query to
+// the cluster whose first coordinate is nearest. Crude, but a genuine
+// partition, which is all the drift statistic needs.
+NeuralRouter spread_router(std::size_t dim, std::size_t clusters) {
+    std::vector<double> w1(dim * clusters, 0.0);
+    std::vector<double> b1(clusters, 0.0);
+    std::vector<double> w2(clusters * clusters, 0.0);
+    std::vector<double> b2(clusters, 0.0);
+    std::vector<double> medoids(clusters);
+    for (std::size_t c = 0; c < clusters; ++c) {
+        w1[0 * clusters + c] = static_cast<double>(c + 1);
+        w2[c * clusters + c] = 1.0;
+        medoids[c] = static_cast<double>(c);
+    }
+    return NeuralRouter::from_json(
+        router_blob(dim, clusters, clusters, w1, b1, w2, b2, medoids));
+}
+
+}  // namespace
+
+TEST(RouterStaleness, AFreshRouterReportsNoDrift) {
+    const Corpus c = make_corpus(2000, 8, 5, 41);
+    HnswIndex index(c.dim, Metric::L2, 8, 100);
+    index.add_batch(c.base.data(), c.n);
+    index.set_router(spread_router(c.dim, 16));
+    index.rebaseline_router();
+
+    const auto health = index.router_health();
+    EXPECT_TRUE(health.comparable);
+    EXPECT_EQ(health.trained_on, c.n);
+    EXPECT_NEAR(health.drift_ratio, 1.0, 0.15)
+        << "nothing changed, so the drift statistic must say so";
+}
+
+TEST(RouterStaleness, RouterWithoutABaselineSaysSoRatherThanGuessing) {
+    const Corpus c = make_corpus(500, 4, 5, 42);
+    HnswIndex index(c.dim, Metric::L2, 8, 100);
+    index.add_batch(c.base.data(), c.n);
+    index.set_router(spread_router(c.dim, 8));
+
+    const auto health = index.router_health();
+    EXPECT_FALSE(health.comparable)
+        << "a router written before staleness tracking has no reference point";
+    EXPECT_DOUBLE_EQ(health.drift_ratio, 1.0)
+        << "and must not invent one that looks like health";
+    EXPECT_GT(health.mean_entry_distance, 0.0)
+        << "the raw measurement is still available";
+}
+
+TEST(RouterStaleness, GrowingIntoNewTerritoryShowsUpAsDrift) {
+    const Corpus c = make_corpus(2000, 8, 5, 43);
+    HnswIndex index(c.dim, Metric::L2, 8, 100);
+    index.add_batch(c.base.data(), c.n);
+    index.set_router(spread_router(c.dim, 16));
+    index.rebaseline_router();
+    const double before = index.router_health().drift_ratio;
+
+    // A second corpus displaced well away from the first. The router has
+    // never seen this region and its medoids do not cover it.
+    Corpus other = make_corpus(2000, 8, 5, 44);
+    for (float& v : other.base) v += 25.0f;
+    index.add_batch(other.base.data(), other.n);
+
+    const auto health = index.router_health();
+    EXPECT_GT(health.drift_ratio, before * 2.0)
+        << "entry points did not move away from the data they now serve";
+    EXPECT_NEAR(health.growth_ratio, 2.0, 0.01);
+}
+
+TEST(RouterStaleness, RepairingMedoidsRecoversMostOfTheDrift) {
+    const Corpus c = make_corpus(2000, 8, 5, 45);
+    HnswIndex index(c.dim, Metric::L2, 8, 100);
+    index.add_batch(c.base.data(), c.n);
+    index.set_router(spread_router(c.dim, 16));
+    index.rebaseline_router();
+
+    Corpus other = make_corpus(2000, 8, 5, 46);
+    for (float& v : other.base) v += 25.0f;
+    index.add_batch(other.base.data(), other.n);
+    const double drifted = index.router_health().mean_entry_distance;
+
+    const std::size_t moved = index.repair_router_medoids();
+    const double repaired = index.router_health().mean_entry_distance;
+
+    EXPECT_GT(moved, 0u) << "nothing moved, so nothing was repaired";
+    EXPECT_LT(repaired, drifted)
+        << "repair should bring entry points back towards the data";
+}
+
+// The honest boundary. Medoid repair moves the *nodes* the classifier lands
+// on; it cannot fix the classifier itself, so a corpus that has grown into
+// regions the partition never modelled does not come all the way back. That
+// residue is what a full retrain is for, and it is the reason the two tiers
+// exist rather than one.
+TEST(RouterStaleness, RepairDoesNotClaimToReplaceARetrain) {
+    const Corpus c = make_corpus(2000, 8, 5, 47);
+    HnswIndex index(c.dim, Metric::L2, 8, 100);
+    index.add_batch(c.base.data(), c.n);
+    index.set_router(spread_router(c.dim, 16));
+    index.rebaseline_router();
+    const double baseline = index.router_health().mean_entry_distance;
+
+    Corpus other = make_corpus(2000, 8, 5, 48);
+    for (float& v : other.base) v += 40.0f;
+    index.add_batch(other.base.data(), other.n);
+    index.repair_router_medoids();
+
+    EXPECT_GT(index.router_health().mean_entry_distance, baseline)
+        << "if repair fully recovered, the second tier would be unnecessary "
+           "and this test should be deleted along with it";
+}
+
+TEST(RouterStaleness, RepairNeverBreaksTheSearch) {
+    // The standing property from module 6: correctness does not depend on
+    // routing quality. Repair moves entry points, so it has to keep it.
+    const Corpus c = make_corpus(3000, 8, 20, 49);
+    HnswIndex index(c.dim, Metric::L2, 8, 100);
+    index.add_batch(c.base.data(), c.n);
+    index.set_router(spread_router(c.dim, 16));
+
+    FlatIndex exact(c.dim);
+    exact.add_batch(c.base.data(), c.n);
+
+    index.repair_router_medoids();
+    for (std::size_t q = 0; q < c.n_queries; ++q) {
+        const float* query = c.queries.data() + q * c.dim;
+        const auto got = index.search(query, 10, 64, /*use_router=*/true);
+        ASSERT_FALSE(got.empty());
+        std::vector<std::int64_t> ids = ids_of(got);
+        std::sort(ids.begin(), ids.end());
+        EXPECT_EQ(std::adjacent_find(ids.begin(), ids.end()), ids.end())
+            << "duplicate ids after repair";
+        for (const Neighbor& n : got) {
+            EXPECT_GE(n.id, 0);
+            EXPECT_LT(n.id, static_cast<std::int64_t>(c.n));
+        }
+    }
+}
+
+TEST(RouterStaleness, RebaselineMakesTheCurrentStateTheNewNormal) {
+    const Corpus c = make_corpus(1500, 8, 5, 50);
+    HnswIndex index(c.dim, Metric::L2, 8, 100);
+    index.add_batch(c.base.data(), c.n);
+    index.set_router(spread_router(c.dim, 16));
+    index.rebaseline_router();
+
+    Corpus other = make_corpus(1500, 8, 5, 51);
+    for (float& v : other.base) v += 25.0f;
+    index.add_batch(other.base.data(), other.n);
+    ASSERT_GT(index.router_health().drift_ratio, 1.5);
+
+    index.repair_router_medoids();
+    index.rebaseline_router();
+    const auto health = index.router_health();
+    EXPECT_NEAR(health.drift_ratio, 1.0, 0.15)
+        << "without rebaselining, a repaired router keeps reporting the drift "
+           "it has just fixed";
+    EXPECT_EQ(health.trained_on, c.n + other.n);
+}
+
+TEST(RouterStaleness, NoRouterMeansNothingToReport) {
+    const Corpus c = make_corpus(500, 4, 5, 52);
+    HnswIndex index(c.dim, Metric::L2, 8, 100);
+    index.add_batch(c.base.data(), c.n);
+
+    const auto health = index.router_health();
+    EXPECT_EQ(health.sampled, 0u);
+    EXPECT_FALSE(health.comparable);
+    EXPECT_EQ(index.repair_router_medoids(), 0u);
+    EXPECT_NO_THROW(index.rebaseline_router());
+}

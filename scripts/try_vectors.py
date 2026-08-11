@@ -266,7 +266,7 @@ class Playground:
         model.fit(ts.x_train, ts.y_train, epochs=25)
         accuracy = float((model.predict(ts.x_val) == ts.y_val).mean())
 
-        blob = router_json(model, km.medoids)
+        blob = router_json(model, km.medoids, vectors=self.base)
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_text(blob, encoding="utf-8")
         self.hnsw.set_router(NeuralRouter.from_json(blob))

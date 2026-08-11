@@ -120,6 +120,49 @@ public:
     // routing badly, and every downstream number would measure the bug.
     const std::vector<float>& last_logits() const { return logits_; }
 
+    // ---- staleness ------------------------------------------------------
+    //
+    // A router is fitted to a snapshot. Vectors added afterwards fall in
+    // clusters that did not exist when it was trained, and the medoids drift
+    // away from the regions they are supposed to represent. Neither shows up
+    // as an error: the search still returns correct results, just from worse
+    // starting points, so nothing complains and the benefit quietly erodes.
+    //
+    // What is measured, and why not the obvious thing
+    // -----------------------------------------------
+    // The obvious drift statistic is distance from a new vector to its
+    // assigned *centroid*. This router deliberately does not store centroids
+    // — they exist during training only, and keeping them would mean two
+    // things that answer the same question and could disagree.
+    //
+    // So drift is measured against the **medoids**, which are stored. That is
+    // not a workaround, it is the better statistic: the medoid is the node the
+    // beam actually starts from, so distance-to-medoid is the quantity that
+    // matters directly, where distance-to-centroid would be a proxy for it.
+
+    std::size_t trained_on() const { return trained_on_; }
+
+    // Mean distance from a training vector to the medoid this router sends it
+    // to, recorded at training time. Zero if the router predates this field,
+    // in which case drift cannot be assessed and says so rather than
+    // inventing a baseline.
+    double baseline_entry_distance() const { return baseline_entry_; }
+    bool has_baseline() const { return baseline_entry_ > 0.0; }
+
+    // Repoint a cluster at a different node. The whole of medoid repair: the
+    // classifier is left alone and only the nodes it lands on are moved.
+    void set_medoid(std::size_t cluster, std::uint32_t node) {
+        if (cluster >= clusters_) {
+            throw std::out_of_range("NeuralRouter::set_medoid: cluster " +
+                                    std::to_string(cluster) + " of " +
+                                    std::to_string(clusters_));
+        }
+        medoids_[cluster] = node;
+    }
+
+    void set_baseline_entry_distance(double distance) { baseline_entry_ = distance; }
+    void set_trained_on(std::size_t n) { trained_on_ = n; }
+
     // Confirm this router actually belongs to the index about to use it.
     void require_compatible(std::size_t index_dim, std::size_t node_count) const {
         if (clusters_ == 0) throw std::logic_error("NeuralRouter: no weights loaded");
@@ -165,6 +208,13 @@ public:
             else if (key == "w2") w2 = read_number_array(p);
             else if (key == "b2") b2 = read_number_array(p);
             else if (key == "medoids") medoids = read_number_array(p);
+            // Both optional: a router written before staleness tracking
+            // existed still loads, and reports that it has no baseline
+            // rather than pretending to one.
+            else if (key == "trained_on")
+                router.trained_on_ = static_cast<std::size_t>(read_int(p));
+            else if (key == "baseline_entry_distance")
+                router.baseline_entry_ = read_double(p);
             else skip_value(p);
 
             skip_ws(p);
@@ -258,6 +308,8 @@ private:
     std::size_t clusters_ = 0;
     std::vector<float> w1_, b1_, w2_, b2_;
     std::vector<std::uint32_t> medoids_;
+    std::size_t trained_on_ = 0;
+    double baseline_entry_ = 0.0;
 
     // Reused across queries so inference allocates nothing. Makes the router
     // non-thread-safe, matching HnswIndex's search for the same reason.

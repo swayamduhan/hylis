@@ -409,7 +409,48 @@ class RouterMLP:
 # --------------------------------------------------------------------------
 
 
-def router_json(model: RouterMLP, medoids: np.ndarray) -> str:
+def baseline_entry_distance(
+    model: RouterMLP,
+    medoids: np.ndarray,
+    vectors: np.ndarray,
+    sample: int = 2000,
+    seed: int = 0,
+) -> float:
+    """Mean distance from a vector to the medoid this router sends it to.
+
+    The reference point for staleness detection. Recorded at training time so
+    that the same measurement taken later can be compared against the router
+    as it was when it was fitted, rather than against an absolute threshold
+    that would have to be different for every corpus.
+
+    Measured against the *medoid*, not the centroid, because that is the node
+    the beam actually starts from -- and because this router format
+    deliberately does not persist centroids (see the note in router.hpp).
+
+    Squared L2 here, matching score_vectors in cpp/hylis/index/distance.hpp:
+    the two figures are compared to each other, so they have to be the same
+    quantity.
+    """
+    vectors = np.asarray(vectors, dtype=np.float32)
+    if vectors.shape[0] == 0:
+        return 0.0
+    rng = np.random.default_rng(seed)
+    n = min(int(sample), vectors.shape[0])
+    idx = rng.choice(vectors.shape[0], size=n, replace=False)
+    picked = vectors[idx]
+
+    clusters = model.predict(picked)
+    entries = np.asarray(medoids, dtype=np.int64)[clusters]
+    diff = picked - vectors[entries]
+    return float(np.mean(np.sum(diff * diff, axis=1)))
+
+
+def router_json(
+    model: RouterMLP,
+    medoids: np.ndarray,
+    vectors: np.ndarray | None = None,
+    trained_on: int | None = None,
+) -> str:
     """Serialise weights in the exact layout cpp/hylis/index/router.hpp reads.
 
     Standardisation is folded into the first layer here rather than exported
@@ -417,11 +458,16 @@ def router_json(model: RouterMLP, medoids: np.ndarray) -> str:
     (b1 - mean/scale @ w1). Doing the algebra once at export means the C++
     forward pass is a plain matmul with nothing to get subtly wrong, and one
     fewer thing that can silently disagree across the language boundary.
+
+    Passing ``vectors`` records the staleness baseline as well. It is optional
+    because a router without one still loads and works -- it simply reports
+    that drift cannot be assessed, which is honest, rather than inventing a
+    reference point.
     """
     w1 = (model.w1 / model.scale).astype(np.float32)
     b1 = (model.b1 - (model.mean / model.scale) @ model.w1).astype(np.float32)
 
-    return json.dumps({
+    payload = {
         "version": 1,
         "dim": int(model.dim),
         "hidden": int(model.hidden),
@@ -431,11 +477,26 @@ def router_json(model: RouterMLP, medoids: np.ndarray) -> str:
         "w2": [float(v) for v in model.w2.astype(np.float32).ravel()],
         "b2": [float(v) for v in model.b2.astype(np.float32).ravel()],
         "medoids": [int(v) for v in np.asarray(medoids).ravel()],
-    })
+    }
+    if vectors is not None:
+        payload["trained_on"] = int(
+            trained_on if trained_on is not None else np.asarray(vectors).shape[0]
+        )
+        payload["baseline_entry_distance"] = baseline_entry_distance(
+            model, medoids, vectors
+        )
+    elif trained_on is not None:
+        payload["trained_on"] = int(trained_on)
+    return json.dumps(payload)
 
 
-def export_router(model: RouterMLP, medoids: np.ndarray, path: str) -> str:
-    blob = router_json(model, medoids)
+def export_router(
+    model: RouterMLP,
+    medoids: np.ndarray,
+    path: str,
+    vectors: np.ndarray | None = None,
+) -> str:
+    blob = router_json(model, medoids, vectors=vectors)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(blob)
     return blob

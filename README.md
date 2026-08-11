@@ -21,7 +21,7 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 | 4 | Learned Index (RMI) | ✅ |
 | 5 | HNSW baseline       | ✅ |
 | 6 | Neural Router       | ✅ |
-| 7 | Incremental retrain | ☐ |
+| 7 | Incremental retrain | ✅ |
 | 8 | Query planner       | ☐ |
 | 9 | Benchmarks          | ☐ |
 | 10| Demo CLI            | ☐ |

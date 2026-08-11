@@ -109,13 +109,53 @@ PYBIND11_MODULE(_hnsw, m) {
            "passes can be compared directly — a transposed weight matrix\n"
            "would otherwise give a router that 'works' while routing badly.")
         .def("medoid", &NeuralRouter::medoid, py::arg("cluster"))
+        .def("set_medoid", &NeuralRouter::set_medoid,
+             py::arg("cluster"), py::arg("node"),
+             "Repoint a cluster at a different node. Medoid repair leaves the\n"
+             "classifier alone and moves only the nodes it lands on.")
         .def_property_readonly("dim", &NeuralRouter::dim)
         .def_property_readonly("hidden", &NeuralRouter::hidden)
         .def_property_readonly("clusters", &NeuralRouter::clusters)
+        .def_property_readonly("trained_on", &NeuralRouter::trained_on,
+                               "Corpus size when this router was fitted; 0 if\n"
+                               "it was written before staleness tracking.")
+        .def_property_readonly("baseline_entry_distance",
+                               &NeuralRouter::baseline_entry_distance,
+                               "Mean distance from a training vector to the\n"
+                               "medoid it routes to, at training time.")
+        .def_property_readonly("has_baseline", &NeuralRouter::has_baseline,
+                               "False when drift cannot be assessed, which is\n"
+                               "reported rather than papered over.")
         .def("__repr__", [](const NeuralRouter& self) {
             return "NeuralRouter(dim=" + std::to_string(self.dim()) +
                    ", hidden=" + std::to_string(self.hidden()) +
                    ", clusters=" + std::to_string(self.clusters()) + ")";
+        });
+
+    py::class_<HnswIndex::RouterHealth>(m, "RouterHealth",
+        "How far a router's entry points have drifted from the data.\n\n"
+        "A stale router still returns correct results, just from worse\n"
+        "starting points -- so nothing fails, and the benefit erodes quietly.\n"
+        "This is what makes that visible.")
+        .def_readonly("sampled", &HnswIndex::RouterHealth::sampled)
+        .def_readonly("trained_on", &HnswIndex::RouterHealth::trained_on)
+        .def_readonly("current_size", &HnswIndex::RouterHealth::current_size)
+        .def_readonly("growth_ratio", &HnswIndex::RouterHealth::growth_ratio,
+                      "current_size / trained_on.")
+        .def_readonly("mean_entry_distance",
+                      &HnswIndex::RouterHealth::mean_entry_distance)
+        .def_readonly("baseline", &HnswIndex::RouterHealth::baseline,
+                      "The same figure, recorded at training time.")
+        .def_readonly("drift_ratio", &HnswIndex::RouterHealth::drift_ratio,
+                      "mean_entry_distance / baseline. Above 1 means entry\n"
+                      "points have moved away from the vectors they serve.")
+        .def_readonly("comparable", &HnswIndex::RouterHealth::comparable,
+                      "False when the router carries no baseline, in which\n"
+                      "case drift_ratio is meaningless and says so.")
+        .def("__repr__", [](const HnswIndex::RouterHealth& h) {
+            return "RouterHealth(drift=" + std::to_string(h.drift_ratio) +
+                   ", growth=" + std::to_string(h.growth_ratio) +
+                   ", comparable=" + (h.comparable ? "True" : "False") + ")";
         });
 
     py::class_<HnswIndex::Stats>(m, "HnswStats", "Shape and cost of a built graph.")
@@ -267,6 +307,25 @@ PYBIND11_MODULE(_hnsw, m) {
                       "Also seed with the graph's own entry point. One extra\n"
                       "distance computation as insurance against a badly\n"
                       "routed query.")
+
+        .def("router_health", &HnswIndex::router_health,
+             py::arg("sample") = 2000, py::arg("seed") = 0,
+             "How far the router's entry points have drifted from the data.\n\n"
+             "Drift costs recall or latency but produces no error, so nothing\n"
+             "else would ever report it. Measured against the medoids rather\n"
+             "than centroids: the medoid is the node the beam actually starts\n"
+             "from, and this router format deliberately does not persist\n"
+             "centroids.")
+        .def("repair_router_medoids", &HnswIndex::repair_router_medoids,
+             "Move every cluster's medoid back onto the data it now covers,\n"
+             "returning how many moved.\n\n"
+             "The cheap repair tier: one pass, classifier untouched. Compare\n"
+             "a full retrain, which is k-means to convergence plus tens of\n"
+             "epochs of gradient descent.")
+        .def("rebaseline_router", &HnswIndex::rebaseline_router,
+             py::arg("sample") = 2000, py::arg("seed") = 0,
+             "Accept the current state as the new normal. Without this a\n"
+             "repaired router keeps reporting the drift it just fixed.")
 
         .def("vector_at", [](const HnswIndex& self, std::int64_t id) {
             const float* v = self.vector_at(id);

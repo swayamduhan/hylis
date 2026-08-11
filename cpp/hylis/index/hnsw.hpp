@@ -166,6 +166,149 @@ public:
     bool router_keeps_global_entry() const { return router_keep_global_; }
     void set_router_keeps_global_entry(bool keep) { router_keep_global_ = keep; }
 
+    // --- router staleness ------------------------------------------------
+
+    struct RouterHealth {
+        std::size_t sampled = 0;
+        std::size_t trained_on = 0;     // corpus size when the router was fitted
+        std::size_t current_size = 0;
+        double growth_ratio = 1.0;      // current_size / trained_on
+        double mean_entry_distance = 0.0;
+        double baseline = 0.0;          // the same figure, at training time
+        double drift_ratio = 1.0;       // mean_entry_distance / baseline
+        bool comparable = false;        // false when there is no baseline
+    };
+
+    // How far the router's entry points have drifted from the data.
+    //
+    // Samples nodes, asks the router where it would start a search for each,
+    // and measures how far that is. Rising means the medoids no longer sit
+    // near the regions they are supposed to represent — which costs recall or
+    // latency but produces no error, so nothing else would ever report it.
+    //
+    // Sampled rather than exhaustive because this is meant to be cheap enough
+    // to call periodically; the statistic is a mean, and a few thousand
+    // samples pin a mean perfectly well.
+    RouterHealth router_health(std::size_t sample = 2000,
+                               std::uint64_t seed = 0) const {
+        RouterHealth health;
+        if (router_.empty() || count_ == 0) return health;
+
+        health.trained_on = router_.trained_on();
+        health.current_size = count_;
+        health.growth_ratio =
+            health.trained_on ? static_cast<double>(count_) /
+                                static_cast<double>(health.trained_on)
+                              : 1.0;
+        health.baseline = router_.baseline_entry_distance();
+        health.comparable = router_.has_baseline();
+
+        std::mt19937_64 rng(seed);
+        const std::size_t n = std::min(sample, count_);
+        double total = 0.0;
+        std::vector<std::uint32_t> entries;
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::uint32_t id =
+                static_cast<std::uint32_t>(rng() % static_cast<std::uint64_t>(count_));
+            const float* v = data_.data() + static_cast<std::size_t>(id) * dim_;
+            router_.entry_points(v, 1, entries);
+            if (entries.empty()) continue;
+            total += static_cast<double>(
+                score_vectors(v, data_.data() + static_cast<std::size_t>(entries[0]) * dim_,
+                              dim_, metric_));
+            ++health.sampled;
+        }
+        if (health.sampled) {
+            health.mean_entry_distance = total / static_cast<double>(health.sampled);
+        }
+        if (health.comparable && health.baseline > 0.0) {
+            health.drift_ratio = health.mean_entry_distance / health.baseline;
+        }
+        return health;
+    }
+
+    // Move every cluster's medoid back onto the data it is now responsible
+    // for. Returns how many moved.
+    //
+    // The cheap repair tier, and the counterpart to the dynamic index's
+    // unlearning: the classifier is left exactly as it was, and only the
+    // nodes it lands on are corrected. One pass — a forward pass and a
+    // running mean per node, then one distance per node to pick the nearest
+    // real vector to each cluster's mean. Compare a full retrain, which is
+    // k-means to convergence plus tens of epochs of gradient descent.
+    //
+    // The mean computed here is a centroid, and it is deliberately not kept:
+    // it is scaffolding for choosing a medoid, and storing it would recreate
+    // exactly the duplicate-source-of-truth the router format avoids.
+    std::size_t repair_router_medoids() {
+        if (router_.empty() || count_ == 0) return 0;
+
+        const std::size_t clusters = router_.clusters();
+        std::vector<double> sums(clusters * dim_, 0.0);
+        std::vector<std::size_t> counts(clusters, 0);
+        std::vector<std::uint32_t> owner(count_, 0);
+        std::vector<std::uint32_t> predicted;
+
+        for (std::size_t id = 0; id < count_; ++id) {
+            const float* v = data_.data() + id * dim_;
+            router_.predict(v, 1, predicted);
+            const std::uint32_t c = predicted.empty() ? 0 : predicted[0];
+            owner[id] = c;
+            ++counts[c];
+            double* acc = sums.data() + static_cast<std::size_t>(c) * dim_;
+            for (std::size_t d = 0; d < dim_; ++d) acc[d] += static_cast<double>(v[d]);
+        }
+
+        std::vector<float> centre(dim_);
+        std::vector<float> best_score(clusters, 0.0f);
+        std::vector<std::uint32_t> best_node(clusters, 0);
+        std::vector<char> found(clusters, 0);
+
+        for (std::size_t id = 0; id < count_; ++id) {
+            const std::uint32_t c = owner[id];
+            if (counts[c] == 0) continue;
+            const double* acc = sums.data() + static_cast<std::size_t>(c) * dim_;
+            for (std::size_t d = 0; d < dim_; ++d) {
+                centre[d] = static_cast<float>(acc[d] / static_cast<double>(counts[c]));
+            }
+            const float s = score_vectors(centre.data(), data_.data() + id * dim_,
+                                          dim_, metric_);
+            // score_vectors is always "smaller is better" whatever the
+            // metric, and ids are visited ascending, so a strict < gives the
+            // same lowest-id tie-break the rest of the index uses.
+            if (!found[c] || s < best_score[c]) {
+                found[c] = 1;
+                best_score[c] = s;
+                best_node[c] = static_cast<std::uint32_t>(id);
+            }
+        }
+
+        std::size_t moved = 0;
+        for (std::size_t c = 0; c < clusters; ++c) {
+            // A cluster the router never predicts has nothing to be nearest
+            // to. Its medoid is left alone: it is unreachable through the
+            // classifier anyway, so moving it would change nothing.
+            if (!found[c]) continue;
+            if (router_.medoid(c) != best_node[c]) {
+                router_.set_medoid(c, best_node[c]);
+                ++moved;
+            }
+        }
+        return moved;
+    }
+
+    // Rebase the drift baseline onto the index as it stands now.
+    //
+    // Called after a repair, or after deliberately accepting the current
+    // state as the new normal. Without it a repaired router would keep
+    // reporting the drift it has just fixed.
+    void rebaseline_router(std::size_t sample = 2000, std::uint64_t seed = 0) {
+        if (router_.empty()) return;
+        const RouterHealth health = router_health(sample, seed);
+        router_.set_baseline_entry_distance(health.mean_entry_distance);
+        router_.set_trained_on(count_);
+    }
+
     void reserve(std::size_t n) {
         data_.reserve(n * dim_);
         levels_.reserve(n);

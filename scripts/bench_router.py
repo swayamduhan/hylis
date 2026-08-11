@@ -103,7 +103,7 @@ def get_router(corpus, label, args):
     model = RouterMLP(dim=corpus.dim, clusters=km.centroids.shape[0],
                       hidden=args.hidden, seed=0)
     model.fit(ts.x_train, ts.y_train, epochs=args.epochs)
-    blob = router_json(model, km.medoids)
+    blob = router_json(model, km.medoids, vectors=corpus.base)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(blob, encoding="utf-8")
     print(f"  trained and saved to {path}")

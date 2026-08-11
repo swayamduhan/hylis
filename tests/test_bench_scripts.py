@@ -181,12 +181,38 @@ def test_fetch_data_explains_sosd_without_downloading_anything():
     assert "duplicate keys" in out
 
 
+def test_router_scaling_study_runs_and_matches_recall():
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_router_scaling.py",
+                    ["--quick", "--random", "30000x16", "--queries", "60",
+                     "--recall", "0.99", "--sizes", "4000,8000"])
+    assert proc.returncode == 0, out
+    assert "Matched recall@10" in out
+    assert "p1 gain" in out, "the extra-entry-point control is missing"
+    assert "descent" in out
+
+
+def test_router_scaling_refuses_a_degenerate_comparison():
+    """If the target recall is reachable at the smallest ef for every n, no
+    row is at its matched-recall point and the gains are not comparable. The
+    script has to say so rather than print a trend."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_router_scaling.py",
+                    ["--quick", "--random", "20000x16", "--queries", "50",
+                     "--recall", "0.10", "--sizes", "4000,8000"])
+    assert proc.returncode == 0, out
+    assert "WARNING" in out and "too easy" in out
+    assert "benefit grows" not in out, "drew a trend from a degenerate table"
+
+
 def test_printed_output_is_console_safe():
     """Windows consoles are cp1252 by default, and an em-dash in a print()
     has already cost this project one UnicodeEncodeError. Cheaper to assert
     than to rediscover."""
     for script in ("bench_sosd.py", "experiment_merge_threshold.py",
-                   "fetch_data.py"):
+                   "fetch_data.py", "experiment_router_scaling.py"):
         text = (SCRIPTS / script).read_text(encoding="utf-8")
         for number, line in enumerate(text.split("\n"), start=1):
             stripped = line.lstrip()
@@ -198,7 +224,8 @@ def test_printed_output_is_console_safe():
 def test_scripts_report_their_own_usage():
     for script in ("bench_index.py", "experiment_curvature.py",
                    "experiment_stage1.py", "bench_vector.py",
-                   "experiment_merge_threshold.py", "bench_sosd.py"):
+                   "experiment_merge_threshold.py", "bench_sosd.py",
+                   "experiment_router_scaling.py"):
         proc, out = run(script, ["--help"])
         assert proc.returncode == 0, out
         assert "usage:" in out.lower()

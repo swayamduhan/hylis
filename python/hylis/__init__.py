@@ -32,6 +32,7 @@ from hylis.vector import (  # noqa: F401
     HnswStats,
     Metric,
     Neighbor,
+    RouterHealth,
 )
 
 __version__ = "0.1.0"
