@@ -207,12 +207,28 @@ def test_router_scaling_refuses_a_degenerate_comparison():
     assert "benefit grows" not in out, "drew a trend from a degenerate table"
 
 
+def test_discontinuity_experiment_settles_the_retracted_claim():
+    """This project predicted in writing that a discontinuous CDF favours the
+    B+ tree, then measured otherwise. The script that settled it has to keep
+    working, or the correction rests on a number nobody can reproduce."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_discontinuity.py", ["--quick"])
+    assert proc.returncode == 0, out
+    assert "cliffs" in out and "max_err" in out
+    assert "The B+ tree won 0 of" in out, (
+        "the B+ tree won a row -- if that is real, cpp/hylis/index/rmi.hpp "
+        "should have its original prediction restored:\n" + out
+    )
+
+
 def test_printed_output_is_console_safe():
     """Windows consoles are cp1252 by default, and an em-dash in a print()
     has already cost this project one UnicodeEncodeError. Cheaper to assert
     than to rediscover."""
     for script in ("bench_sosd.py", "experiment_merge_threshold.py",
-                   "fetch_data.py", "experiment_router_scaling.py"):
+                   "fetch_data.py", "experiment_router_scaling.py",
+                   "experiment_discontinuity.py"):
         text = (SCRIPTS / script).read_text(encoding="utf-8")
         for number, line in enumerate(text.split("\n"), start=1):
             stripped = line.lstrip()
@@ -225,7 +241,8 @@ def test_scripts_report_their_own_usage():
     for script in ("bench_index.py", "experiment_curvature.py",
                    "experiment_stage1.py", "bench_vector.py",
                    "experiment_merge_threshold.py", "bench_sosd.py",
-                   "experiment_router_scaling.py"):
+                   "experiment_router_scaling.py",
+                   "experiment_discontinuity.py"):
         proc, out = run(script, ["--help"])
         assert proc.returncode == 0, out
         assert "usage:" in out.lower()

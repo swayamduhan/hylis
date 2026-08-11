@@ -100,6 +100,78 @@ const char* name_of(Shape s) {
 const Shape kAllShapes[] = {Shape::SequentialGaps, Shape::Uniform,
                             Shape::Lognormal, Shape::Clustered};
 
+// The corrected claim.
+//
+// This file's header used to predict that a discontinuous CDF is where a B+
+// tree beats the learned index. scripts/experiment_discontinuity.py measured
+// it across cliff densities from 64 to n/2 and the RMI won every row by
+// 3-7x. This pins the mechanism so the wrong claim cannot quietly come back.
+TEST(Discontinuity, ABadModelDegradesIntoABoundedSearchNotAScan) {
+    // The worst case for piecewise-linear fitting: tight clumps with huge
+    // gaps, and few enough models that many of them straddle a cliff.
+    const auto keys = make_keys(Shape::Clustered, 200000, 91);
+    ASSERT_GT(keys.size(), 50000u);
+    Index idx = build(keys, /*models=*/1024);
+
+    const auto stats = idx.stats();
+    EXPECT_GT(stats.max_error, 50u)
+        << "this distribution is supposed to produce badly fitted models; if "
+           "it no longer does, the test is no longer testing anything";
+
+    // And yet every lookup stays inside a bounded probe budget, because the
+    // window search falls back to binary search rather than scanning. That
+    // is why the tree cannot win: the model's floor is a bounded search over
+    // a contiguous array, and a tree descent is a slower version of that.
+    std::size_t worst = 0;
+    for (std::size_t i = 0; i < keys.size(); i += 97) {
+        worst = std::max(worst, idx.probes(keys[i]));
+    }
+    const std::size_t budget =
+        std::max<std::size_t>(idx.search_threshold(), 32) + 8;
+    EXPECT_LE(worst, budget)
+        << "worst probe count " << worst << " with max_error "
+        << stats.max_error << ": a bad model has started costing more than a "
+           "bounded search, which is the assumption the correction rests on";
+}
+
+// A discontinuous CDF DOES cost more probes than a smooth one — measured at
+// 64 against 4. That is worth stating plainly, because it is the half of the
+// picture the original prediction got right, and an earlier version of this
+// test wrongly asserted the probe counts were comparable.
+//
+// The prediction still fails, because probes are not proportional to time.
+// The 64 is a linear scan of `search_threshold` *contiguous* elements — one
+// or two cache lines — while a B+ tree's 4 probes are pointer-chased and miss
+// cache every time. Counting comparisons flatters the tree; the timing in
+// scripts/experiment_discontinuity.py is what settles it.
+TEST(Discontinuity, CliffsCostMoreProbesButTheCostStaysBounded) {
+    const auto few = make_keys(Shape::SequentialGaps, 100000, 92);
+    Index smooth = build(few, 16384);
+    const auto clumpy = make_keys(Shape::Clustered, 100000, 93);
+    Index rough = build(clumpy, 16384);
+
+    std::size_t worst_smooth = 0, worst_rough = 0;
+    for (std::size_t i = 0; i < few.size(); i += 101) {
+        worst_smooth = std::max(worst_smooth, smooth.probes(few[i]));
+    }
+    for (std::size_t i = 0; i < clumpy.size(); i += 101) {
+        worst_rough = std::max(worst_rough, rough.probes(clumpy[i]));
+    }
+
+    EXPECT_GE(worst_rough, worst_smooth)
+        << "the clustered shape is supposed to be the harder one";
+
+    // The load-bearing part: it is bounded, not merely larger. Either a scan
+    // capped at the threshold, or a binary search capped at log2(n) — never
+    // proportional to n, which is what would actually hand the tree a win.
+    const std::size_t ceiling =
+        std::max<std::size_t>(rough.search_threshold(), 21) + 4;
+    EXPECT_LE(worst_rough, ceiling)
+        << "worst probe count " << worst_rough << " exceeds the bounded-search "
+           "budget; a model has degraded into something worse than a capped "
+           "search, which is the assumption the correction rests on";
+}
+
 }  // namespace
 
 // --------------------------------------------------------------------------

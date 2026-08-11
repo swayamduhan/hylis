@@ -243,8 +243,17 @@ def synthetic_keys(
     ``lognormal``        heavy right tail; the distribution the original RMI
                          paper used.
     ``clustered``        dense clumps separated by wide empty gaps, emulating
-                         the SOSD ``fb`` dataset. The adversarial case, where a
-                         B+ tree is expected to *beat* the learned index.
+                         the SOSD ``fb`` dataset. The hardest shape for a
+                         piecewise-linear fit, and the one that carries ~45x
+                         the position error of ``uniform``.
+
+                         It was expected to be the case where a B+ tree beats
+                         the learned index. It is not:
+                         scripts/experiment_discontinuity.py sweeps the cliff
+                         count from 64 to 250,000 and the RMI wins every row
+                         by 3-7x. See the note in cpp/hylis/index/rmi.hpp for
+                         why. Still the right stress case -- just not a
+                         reversal.
 
     Values are the row ids 0..n-1, which is what the engine stores against a
     key anyway.

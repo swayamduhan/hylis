@@ -33,8 +33,36 @@
 // What that does *not* fix is a discontinuity. A CDF with a cliff in it (the
 // `clustered` generator, or SOSD's `fb`) has unbounded second derivative, so
 // whichever model straddles the cliff eats the full error no matter how large
-// M gets. That is exactly the case where a B+ tree — which is
-// distribution-free — should win, and the benchmark is set up to show it.
+// M gets.
+//
+// This comment used to go on to predict that such a distribution is where a
+// B+ tree — being distribution-free — should win. **That prediction was
+// measured and is wrong**, and it is left here corrected rather than deleted
+// because the reasoning behind it is a natural mistake to make.
+//
+// scripts/experiment_discontinuity.py sweeps the number of cliffs from 64 to
+// 250,000 over 500,000 keys. The RMI wins every row, by 3-7x, and its margin
+// *grows* as cliffs are added. Two things the original reasoning missed:
+//
+//   * Only the models straddling a cliff are hurt, and there are at most as
+//     many of those as there are cliffs. Lookup cost follows the typical
+//     model, not the worst one.
+//   * A model that is hurt does not degrade without bound. Its window is
+//     either scanned, capped at `search_threshold`, or binary-searched above
+//     that, capped at O(log n). Measured worst case on the clustered shape:
+//     64 comparisons with a max_error of 3,299 — the scan, at the threshold.
+//
+// That second point is worth being precise about, because a cliff genuinely
+// does cost more *comparisons*: 64 against 4 for a smooth CDF. What it does
+// not cost is more *time*, because those 64 are a linear pass over one or two
+// cache lines of a contiguous array, while a B+ tree's 4 are pointer-chased
+// and miss cache every time. Counting comparisons flatters the tree. The
+// model can only ever degrade into a bounded search over a flat array, and a
+// tree descent is a slower version of exactly that — which is why no
+// distribution hands the tree a win on lookups.
+//
+// The B+ tree's real claim is mutability, which is what module 4 measured and
+// what dynamic_rmi.hpp exists to answer. Not any shape of data.
 //
 // Immutability, and the way out of it
 // -----------------------------------
