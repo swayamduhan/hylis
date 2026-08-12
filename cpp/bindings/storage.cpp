@@ -58,14 +58,17 @@ PYBIND11_MODULE(_storage, m) {
              "Delete by key. Returns True if a record was removed.")
         .def("contains", &RecordStore::contains, py::arg("key"),
              "True if the key exists.")
-        .def("keys", [](const RecordStore& self) {
-             auto v = self.keys();
-             return py::make_iterator(v.begin(), v.end());
-        }, py::keep_alive<0, 1>(), "List of all primary keys (unsorted).")
-        .def("records", [](const RecordStore& self) {
-             auto v = self.records();
-             return py::make_iterator(v.begin(), v.end());
-        }, py::keep_alive<0, 1>(), "Iterate all records (unsorted).")
+        // Returned by value, not as an iterator.
+        //
+        // These previously built a local vector and handed back
+        // py::make_iterator over it, with keep_alive<0,1> pinning the *store*.
+        // The store staying alive does nothing for the vector, which is
+        // destroyed when the lambda returns — so the iterator dangled and read
+        // freed memory, usually without visible symptoms. Returning the vector
+        // lets pybind11's stl.h convert it to the list both docstrings already
+        // promised.
+        .def("keys", &RecordStore::keys, "List of all primary keys (unsorted).")
+        .def("records", &RecordStore::records, "All records (unsorted).")
         .def("checkpoint", &RecordStore::checkpoint,
              "Snapshot state to disk and truncate the WAL.")
         .def("close", &RecordStore::close, "Close the WAL file handle.")
