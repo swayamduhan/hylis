@@ -31,6 +31,19 @@ from hylis.query import (  # noqa: F401
     Predicate,
     QueryPlan,
 )
+from hylis.schema import (  # noqa: F401
+    ColumnDef,
+    ColumnShape,
+    KeyEncoding,
+    LogicalType,
+    Schema,
+    candidates_for,
+    format_value,
+    measure_shape,
+    parse_value,
+    prefix_upper_bound,
+    type_supports_rmi,
+)
 from hylis.storage import Record, RecordStore  # noqa: F401
 from hylis.vector import (  # noqa: F401
     FlatIndex,

@@ -246,13 +246,49 @@ def test_planner_calibration_beats_the_inherited_threshold():
     assert "calibrated: crossover measured at" in out
 
 
+def test_double_rmi_experiment_settles_whether_double_gets_a_learned_index():
+    """E1. The typed column layer has to decide whether Double sits with Int64
+    or with String in the index-family table, and this is the measurement that
+    decided it. If exactness ever fails here, type_supports_rmi(Double) must
+    become False -- so a silent break would leave the type table asserting
+    something no longer measured."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_double_rmi.py", ["--quick"])
+    assert proc.returncode == 0, out
+    assert "exact" in out and "speedup" in out
+    assert "wide_range" in out, "the pathological arm is missing"
+    assert "exactness held in every arm:        yes" in out, (
+        "the RMI stopped being exact over float64 keys. If that is real, "
+        "Double must lose its learned index:\n" + out
+    )
+    assert "ADOPT" in out
+
+
+def test_duplicate_key_experiment_compares_equal_work():
+    """E3. The first version of this measured composite's lookup (which
+    materialises every match) against position's find (which returns one row)
+    and reported position ahead by 300x for doing 1000x less work. Both arms
+    must return the same rows or the verdict is meaningless."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_duplicate_keys.py", ["--quick"])
+    assert proc.returncode == 0, out
+    assert "eq comp" in out and "eq posn" in out
+    assert "Both arms return the same rows" in out
+    # max_error = 0 over ranks is the structural finding, not a good score:
+    # the model is handed 0, 1, 2, ... m-1 and asked to predict it.
+    assert "Nothing about the data was learned" in out
+
+
 def test_printed_output_is_console_safe():
     """Windows consoles are cp1252 by default, and an em-dash in a print()
     has already cost this project one UnicodeEncodeError. Cheaper to assert
     than to rediscover."""
     for script in ("bench_sosd.py", "experiment_merge_threshold.py",
                    "fetch_data.py", "experiment_router_scaling.py",
-                   "experiment_discontinuity.py", "bench_planner.py"):
+                   "experiment_discontinuity.py", "bench_planner.py",
+                   "experiment_double_rmi.py", "experiment_duplicate_keys.py"):
         text = (SCRIPTS / script).read_text(encoding="utf-8")
         for number, line in enumerate(text.split("\n"), start=1):
             stripped = line.lstrip()
@@ -266,7 +302,8 @@ def test_scripts_report_their_own_usage():
                    "experiment_stage1.py", "bench_vector.py",
                    "experiment_merge_threshold.py", "bench_sosd.py",
                    "experiment_router_scaling.py",
-                   "experiment_discontinuity.py", "bench_planner.py"):
+                   "experiment_discontinuity.py", "bench_planner.py",
+                   "experiment_double_rmi.py", "experiment_duplicate_keys.py"):
         proc, out = run(script, ["--help"])
         assert proc.returncode == 0, out
         assert "usage:" in out.lower()

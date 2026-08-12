@@ -74,3 +74,34 @@ def test_checkpoint(tmp_path):
     s2 = _storage.RecordStore(str(d))
     assert len(s2) == 50
     s2.close()
+
+
+def test_keys_and_records_return_real_lists(tmp_path):
+    """These used to hand back py::make_iterator over a *local* vector, with
+    keep_alive pinning the store -- which does nothing for the vector. The
+    iterators dangled and read freed memory, usually with no visible symptom.
+
+    Returning the vector is what both docstrings always promised, and a list
+    is what a caller can take len() of or iterate twice."""
+    d = tmp_path / "store"
+    d.mkdir()
+    s = _storage.RecordStore(str(d))
+    for i in range(20):
+        s.put(_storage.Record(i, {"label": f"row{i}"}))
+
+    keys = s.keys()
+    records = s.records()
+    assert isinstance(keys, list)
+    assert isinstance(records, list)
+    assert len(keys) == 20
+    assert sorted(keys) == list(range(20))
+    assert sorted(r.key for r in records) == list(range(20))
+    # Iterating twice has to give the same answer; an exhausted iterator
+    # would silently give nothing the second time.
+    assert sorted(r.key for r in records) == sorted(r.key for r in records)
+    # Indexed by key, not by position: the store returns records in hash
+    # order and says so, so a positional assertion here would be testing an
+    # ordering nothing promises.
+    by_key = {r.key: r for r in records}
+    assert by_key[7].get("label") == "row7"
+    s.close()

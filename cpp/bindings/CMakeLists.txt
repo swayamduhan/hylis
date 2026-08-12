@@ -64,6 +64,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/hnsw.cpp")
     hylis_add_binding(_hnsw hnsw.cpp)
 endif()
 
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/schema.cpp")
+    hylis_add_binding(_schema schema.cpp)
+endif()
+
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/planner.cpp")
     hylis_add_binding(_planner planner.cpp)
 endif()

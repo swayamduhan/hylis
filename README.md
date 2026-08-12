@@ -23,8 +23,9 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 | 6 | Neural Router       | ✅ |
 | 7 | Incremental retrain | ✅ |
 | 8 | Query planner       | ✅ |
-| 9 | Benchmarks          | ☐ |
-| 10| Demo CLI            | ☐ |
+| 9 | Typed columns       | ◐ phase A of 5 |
+| 10| Benchmarks          | ☐ |
+| 11| Demo CLI            | ☐ |
 
 ## What is left, and why in this order
 
@@ -40,7 +41,15 @@ That was module 8, and it is now built. The rest, ranked by value:
 **1. ~~The hybrid query planner (module 8).~~** ✅ Done — see below.
 
 **2. Wire `RecordStore` to `ColumnIndex`.** Module 1 is complete, tested, and
-connected to nothing — no index reads from the store it built.
+connected to nothing — no index reads from the store it built. Starting this
+turned up a problem *underneath* the wiring: `ColumnIndex` was hard-wired to
+`int64 → int64`, which is fine for a synthetic key array and wrong for a table
+with prices, categories, titles, flags and timestamps. **Phase A of the typed
+column layer is now built** (see below). What remains: the `Table` join
+itself, a bitmap family for `Bool` and low-cardinality columns, typed
+predicates through the planner, and vectors declared in the schema but stored
+outside the record — a 128-float embedding is ~700 bytes of base64 per row and
+would make the write-ahead log the dominant cost of the system.
 
 **3. Vector deletion.** Module 7 made the structured side fully mutable, but
 `HnswIndex` and `FlatIndex` stay append-only, so `DynamicRMIndex::erase` has no
@@ -52,8 +61,56 @@ limitation this README already states below: insertion still descends the
 hierarchy, which is why the layer-0-only build does not scale. Highest research
 value, highest risk.
 
-**5. Modules 9 and 10 are largely done** — nine benchmark scripts and two
+**5. Modules 10 and 11 are largely done** — eleven benchmark scripts and two
 interactive REPLs exist. What remains is consolidation, not new work.
+
+## Typed columns
+
+The logical type of a column decides which index families are *candidates*;
+measurement decides among the survivors. Type as a hard filter, cost as the
+tiebreak.
+
+| | B+ tree | RMI / DynamicRMI | Bitmap | HNSW / routed / flat |
+|---|---|---|---|---|
+| `Int64` | ✅ | ✅ | phase C | — |
+| `Double` | ✅ | ✅ | phase C | — |
+| `Timestamp` | ✅ | ✅ | — | — |
+| `String` | ✅ **native** | ❌ structurally | phase C | — |
+| `Bool` | ❌ pointless | ❌ | phase C | — |
+| `Vector` | ❌ | ❌ | ❌ | ✅ |
+
+The ❌ in `String` × RMI is a fact about learned indexes rather than a
+limitation here: `RMIndex` fits models to `static_cast<double>(key)`, and a
+model over string *ranks* would be fitted to an ordering the model itself
+imposed. `BPlusTree` meanwhile touches keys only through `lower_bound` and
+`==`, so it serves strings natively with no change at all — which is why a
+string column is indexed as a string and never encoded to an integer.
+
+That buys a capability, not just tidiness. `title LIKE 'nike%'` is the
+half-open range `[p, succ(p))` — one descent and a leaf walk — and it is
+impossible under any integer encoding of the string.
+
+Duplicated values key on `pair<value, row_id>`, the textbook secondary-index
+representation, which `std::pair`'s ordering supports for free.
+
+```bash
+python scripts/experiment_double_rmi.py       # E1: are float64 keys exact?
+python scripts/experiment_duplicate_keys.py   # E3: composite vs position
+```
+
+**E1 — yes, adopt.** A learned index over float64 keys stayed exact in every
+arm and beat the B+ tree on 5 of 5 realistic distributions at 1M keys
+(2.4×–12.2×). Values log-spaced across sixteen orders of magnitude inflate the
+error bound **83×** and it is *still* exact and still faster: with float64
+keys the models get worse and the answers do not, because exactness is
+measured per key at build time.
+
+**E3 — no, drop.** The position encoding lost point lookups by up to 7× and
+won range scans by at most 1.4×, so the composite tree takes duplicated
+numeric columns. The reason underneath the timings: keying on sorted rank
+hands the model `0, 1, 2, … m-1`, which one linear model fits with **zero
+error** — nothing about the data is learned, and calling the result a learned
+index would misdescribe it.
 
 ### The framing these add up to
 
@@ -81,8 +138,11 @@ rather than papered over.
 cpp/
   hylis/
     storage/    # record store + write-ahead log (header-only)
-    index/      # B+ tree, RMI, per-column selection, flat + HNSW vector search
-  bindings/     # pybind11 -> hylis._storage, _btree, _flat, _rmi, _hnsw
+    index/      # B+ tree, RMI, logical types, per-column selection,
+                #   flat + HNSW vector search
+    query/      # schema, hybrid query planner
+  bindings/     # pybind11 -> hylis._storage, _btree, _flat, _rmi, _hnsw,
+                #   _planner, _schema
   tests/        # GoogleTest suites for the C++ core
 python/hylis/   # user-facing Python API; built extensions land here
   datasets.py   # data generators + loaders + the brute-force oracle

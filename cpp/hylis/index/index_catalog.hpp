@@ -53,6 +53,13 @@ inline std::string to_json(const std::string& column, const IndexPlan& plan) {
     std::string out = "{";
     out += "\"column\":\"" + escape_string(column) + "\",";
     out += "\"kind\":\"" + std::string(to_string(plan.kind)) + "\",";
+    // What the column is, and how its values became keys. These are what
+    // decided which structures were candidates at all, so a plan without them
+    // records the answer but not the question.
+    out += "\"type\":\"" + std::string(to_string(plan.type)) + "\",";
+    out += "\"encoding\":\"" + std::string(to_string(plan.encoding)) + "\",";
+    out += "\"distinct\":" + std::to_string(plan.distinct) + ",";
+    out += "\"monotone\":" + std::string(plan.monotone ? "1" : "0") + ",";
     out += "\"rmi_models\":" + std::to_string(plan.rmi_models) + ",";
     out += "\"search_threshold\":" + std::to_string(plan.search_threshold) + ",";
     out += "\"btree_order\":" + std::to_string(plan.btree_order) + ",";
@@ -100,6 +107,14 @@ inline std::pair<std::string, IndexPlan> from_json(const char*& p) {
             column = read_string(p);
         } else if (key == "kind") {
             plan.kind = index_kind_from_string(read_string(p));
+        } else if (key == "type") {
+            plan.type = logical_type_from_string(read_string(p));
+        } else if (key == "encoding") {
+            plan.encoding = key_encoding_from_string(read_string(p));
+        } else if (key == "distinct") {
+            plan.distinct = static_cast<std::size_t>(read_int(p));
+        } else if (key == "monotone") {
+            plan.monotone = read_int(p) != 0;
         } else if (key == "rmi_models") {
             plan.rmi_models = static_cast<std::size_t>(read_int(p));
         } else if (key == "search_threshold") {

@@ -56,6 +56,9 @@
 // CompareOp is shared with the learned index — see the header for why the
 // two structures must present the same predicate interface.
 #include "index/compare_op.hpp"
+// So memory_bytes() can account for keys that own heap memory. A std::string
+// key is the case sizeof cannot see.
+#include "index/key_bytes.hpp"
 
 namespace hylis::index {
 
@@ -147,6 +150,29 @@ public:
         for (; leaf != nullptr; leaf = leaf->next, i = 0) {
             for (; i < leaf->keys.size(); ++i) {
                 if (hi < leaf->keys[i]) return out;
+                out.push_back(leaf->values[i]);
+            }
+        }
+        return out;
+    }
+
+    // Values for keys in [lo, hi), ascending. The half-open form, which
+    // range() cannot express.
+    //
+    // Needed because two predicates are naturally half-open and neither has an
+    // inclusive upper bound to offer. A string prefix `p` covers [p, succ(p)),
+    // and there is no largest string beginning with p — strings are unbounded
+    // in length, so the inclusive form has no `hi` to name. Equality on a
+    // composite (value, row) key is the same shape one level down.
+    std::vector<Value> range_half_open(const Key& lo, const Key& hi) const {
+        std::vector<Value> out;
+        if (!(lo < hi)) return out;
+
+        const LeafNode* leaf = descend(lo);
+        std::size_t i = lower_bound_idx(leaf->keys, lo);
+        for (; leaf != nullptr; leaf = leaf->next, i = 0) {
+            for (; i < leaf->keys.size(); ++i) {
+                if (!(leaf->keys[i] < hi)) return out;
                 out.push_back(leaf->values[i]);
             }
         }
@@ -331,6 +357,11 @@ private:
     static std::size_t node_bytes(const Node* n) {
         if (n == nullptr) return 0;
         std::size_t total = n->keys.capacity() * sizeof(Key);
+        // Whatever the keys own beyond their slots. Zero for every arithmetic
+        // key — so the figures already measured for int64 columns are
+        // unchanged to the byte — and the characters of the string for a
+        // string key, which sizeof does not see. See index/key_bytes.hpp.
+        for (const Key& k : n->keys) total += KeyHeapBytes<Key>::of(k);
         if (n->is_leaf) {
             const auto* leaf = static_cast<const LeafNode*>(n);
             total += sizeof(LeafNode) + leaf->values.capacity() * sizeof(Value);

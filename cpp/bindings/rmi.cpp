@@ -30,16 +30,126 @@ namespace py = pybind11;
 
 using hylis::index::ColumnIndex;
 using hylis::index::ColumnKey;
+using hylis::index::ColumnShape;
 using hylis::index::ColumnValue;
 using hylis::index::CompareOp;
+using hylis::index::Datum;
 using hylis::index::IndexCatalog;
 using hylis::index::IndexKind;
+using hylis::index::KeyEncoding;
+using hylis::index::LogicalType;
 using hylis::index::Workload;
 using hylis::index::IndexPlan;
 using hylis::index::LinearModel;
 
 using Learned = hylis::index::RMIndex<std::int64_t, std::int64_t>;
 using Dynamic = hylis::index::DynamicRMIndex<std::int64_t, std::int64_t>;
+
+namespace {
+
+// A Python scalar as a typed column value.
+//
+// bool is checked first because in Python bool is a subclass of int, so the
+// natural order would turn every True into 1 and silently retype a Bool
+// column's predicate into an Int64 one.
+Datum datum_from_py(py::handle value) {
+    if (py::isinstance<py::bool_>(value)) return Datum{value.cast<bool>()};
+    if (py::isinstance<py::int_>(value)) return Datum{value.cast<std::int64_t>()};
+    if (py::isinstance<py::float_>(value)) return Datum{value.cast<double>()};
+    if (py::isinstance<py::str>(value)) return Datum{value.cast<std::string>()};
+    throw std::invalid_argument(
+        "a column value must be an int, float, str or bool; got " +
+        std::string(py::str(py::type::of(value))));
+}
+
+// Dispatch a typed build on the logical type, which is what says how to read
+// the key list. Keys stay in a concrete vector<T> rather than a vector of
+// variants: a variant carrying std::string is 40 bytes, and the ingest path
+// is exactly where that would be paid a million times over.
+ColumnIndex build_typed_from_py(LogicalType type, const py::object& keys,
+                                const std::vector<ColumnValue>& values,
+                                std::size_t size_budget, double write_fraction) {
+    Workload workload;
+    workload.write_fraction = write_fraction;
+    switch (type) {
+        case LogicalType::Int64:
+        case LogicalType::Timestamp:
+            return ColumnIndex::build_typed(
+                type, keys.cast<std::vector<std::int64_t>>(), values,
+                size_budget, workload);
+        case LogicalType::Double:
+            return ColumnIndex::build_typed(
+                type, keys.cast<std::vector<double>>(), values, size_budget,
+                workload);
+        case LogicalType::String:
+            return ColumnIndex::build_typed(
+                type, keys.cast<std::vector<std::string>>(), values, size_budget,
+                workload);
+        case LogicalType::Bool:
+            throw std::invalid_argument(
+                "a bool column has two distinct values, so an ordered index "
+                "over it degenerates to a sorted list of every row in the "
+                "table. It is served by a bitmap instead (module phase C).");
+        case LogicalType::Vector:
+            break;
+    }
+    throw std::invalid_argument(
+        "a vector column is served by the graph indexes, not by a scalar one");
+}
+
+// Replay a typed plan without re-measuring. The dispatch is the same shape as
+// build_typed_from_py; both exist because the logical type is what says how to
+// read the key list.
+ColumnIndex build_typed_with_from_py(LogicalType type, const py::object& keys,
+                                     const std::vector<ColumnValue>& values,
+                                     const IndexPlan& plan) {
+    switch (type) {
+        case LogicalType::Int64:
+        case LogicalType::Timestamp:
+            return ColumnIndex::build_typed_with(
+                type, keys.cast<std::vector<std::int64_t>>(), values, plan);
+        case LogicalType::Double:
+            return ColumnIndex::build_typed_with(
+                type, keys.cast<std::vector<double>>(), values, plan);
+        case LogicalType::String:
+            return ColumnIndex::build_typed_with(
+                type, keys.cast<std::vector<std::string>>(), values, plan);
+        default:
+            break;
+    }
+    throw std::invalid_argument(
+        "build_typed_with: only scalar columns have a plan to replay");
+}
+
+// Build one specific typed plan and time it. The comparison an experiment
+// needs: choose_index reports only its winner, so measuring a structure it
+// rejected has to be possible from outside.
+IndexPlan measure_typed_from_py(LogicalType type, const py::object& keys,
+                                const std::vector<ColumnValue>& values,
+                                const IndexPlan& plan, double write_fraction) {
+    Workload workload;
+    workload.write_fraction = write_fraction;
+    switch (type) {
+        case LogicalType::Int64:
+        case LogicalType::Timestamp:
+            return hylis::index::measure_plan_for(
+                type, keys.cast<std::vector<std::int64_t>>(), values, plan,
+                workload);
+        case LogicalType::Double:
+            return hylis::index::measure_plan_for(
+                type, keys.cast<std::vector<double>>(), values, plan, workload);
+        case LogicalType::String:
+            return hylis::index::measure_plan_for(
+                type, keys.cast<std::vector<std::string>>(), values, plan,
+                workload);
+        default:
+            break;
+    }
+    throw std::invalid_argument(
+        "measure_plan_typed: only scalar columns have a plan to measure");
+}
+
+}  // namespace
 
 PYBIND11_MODULE(_rmi, m) {
     m.doc() = "hylis learned index core (C++): two-stage RMI, per-column selection";
@@ -240,6 +350,59 @@ PYBIND11_MODULE(_rmi, m) {
 
     // ----------------------------------------------------------- selection
 
+    // --------------------------------------------------------- logical types
+    //
+    // What a column *is*, as opposed to how it is stored. This is a hard
+    // filter on which structures are candidates: RMIndex fits models to
+    // static_cast<double>(key), so a learned index over strings would be
+    // fitting a model to an ordering the model itself imposed.
+    py::enum_<LogicalType>(m, "LogicalType",
+        "A column's logical type. Decides which index families can serve it.")
+        .value("Int64", LogicalType::Int64)
+        .value("Double", LogicalType::Double)
+        .value("String", LogicalType::String,
+               "Indexed natively by the B+ tree. Never encoded to an integer.")
+        .value("Bool", LogicalType::Bool,
+               "Two distinct values; an ordered index over it is pointless.")
+        .value("Timestamp", LogicalType::Timestamp,
+               "Physically int64 epoch millis, logically distinct: different\n"
+               "parse and format, plus a near-monotonicity prior.")
+        .value("Vector", LogicalType::Vector,
+               "Served by the graph indexes, never by a scalar one.");
+
+    py::enum_<KeyEncoding>(m, "KeyEncoding",
+        "How a column's values become index keys.")
+        .value("Native", KeyEncoding::Native, "The value itself. Unique columns.")
+        .value("Composite", KeyEncoding::Composite,
+               "(value, row id). What makes a duplicated column indexable.")
+        .value("Position", KeyEncoding::Position,
+               "Sorted rank. Reserved for a learned index over a duplicated\n"
+               "numeric column; see experiment E3.")
+        .value("Dictionary", KeyEncoding::Dictionary,
+               "A dense code per distinct value, with one bitmap each.");
+
+    m.def("type_supports_rmi", &hylis::index::type_supports_rmi, py::arg("type"),
+          "Whether a learned index can serve this type at all. False for\n"
+          "String and Bool, and that is a fact about learned indexes rather\n"
+          "than a limitation of this implementation.");
+
+    py::class_<ColumnShape>(m, "ColumnShape",
+        "What one pass over a sorted column tells the candidate filter.")
+        .def_readonly("rows", &ColumnShape::rows)
+        .def_readonly("distinct", &ColumnShape::distinct)
+        .def_readonly("unique", &ColumnShape::unique)
+        .def_readonly("monotone", &ColumnShape::monotone,
+                      "Row ids ascending in key order: the column arrived in\n"
+                      "order, which is what makes an append-only write path legal.")
+        .def_property_readonly("duplicate_fraction",
+                               &ColumnShape::duplicate_fraction)
+        .def("__repr__", [](const ColumnShape& s) {
+            return "ColumnShape(rows=" + std::to_string(s.rows) +
+                   ", distinct=" + std::to_string(s.distinct) +
+                   ", unique=" + std::string(s.unique ? "True" : "False") +
+                   ", monotone=" + std::string(s.monotone ? "True" : "False") + ")";
+        });
+
     py::enum_<IndexKind>(m, "IndexKind", "Which structure a column was given.")
         .value("BPlusTree", IndexKind::BPlusTree)
         .value("RMI", IndexKind::RMI,
@@ -254,6 +417,13 @@ PYBIND11_MODULE(_rmi, m) {
         "them means rebuilding and re-timing every candidate structure.")
         .def(py::init<>())
         .def_readwrite("kind", &IndexPlan::kind)
+        .def_readwrite("type", &IndexPlan::type,
+                       "The column's logical type. Recorded because it is what\n"
+                       "decided which structures were candidates: a plan without\n"
+                       "it records the answer but not the question.")
+        .def_readwrite("encoding", &IndexPlan::encoding)
+        .def_readwrite("distinct", &IndexPlan::distinct)
+        .def_readwrite("monotone", &IndexPlan::monotone)
         .def_readwrite("rmi_models", &IndexPlan::rmi_models)
         .def_readwrite("search_threshold", &IndexPlan::search_threshold)
         .def_readwrite("btree_order", &IndexPlan::btree_order)
@@ -338,6 +508,20 @@ PYBIND11_MODULE(_rmi, m) {
         .def_static("build_with", &ColumnIndex::build_with,
                     py::arg("keys"), py::arg("values"), py::arg("plan"),
                     "Replay a decision made earlier, skipping the measurement.")
+        .def_static("build_typed_with", &build_typed_with_from_py,
+                    py::arg("type"), py::arg("keys"), py::arg("values"),
+                    py::arg("plan"),
+                    "Replay a typed decision made earlier, skipping the\n"
+                    "measurement. What catalog replay does on reopen.")
+        .def_static("build_typed", &build_typed_from_py,
+                    py::arg("type"), py::arg("keys"), py::arg("values"),
+                    py::arg("size_budget") = std::numeric_limits<std::size_t>::max(),
+                    py::arg("write_fraction") = 0.0,
+                    "Auto-tune a column of a given logical type.\n\n"
+                    "`keys` must be ascending and the same length as `values`,\n"
+                    "which are row ids. Repeated keys are allowed and select\n"
+                    "the composite encoding; a string column is indexed as a\n"
+                    "string and is never encoded to an integer.")
         .def("find", [](const ColumnIndex& self, std::int64_t key) -> py::object {
             const std::int64_t* v = self.find(key);
             return v ? py::cast(*v) : py::none();
@@ -345,16 +529,81 @@ PYBIND11_MODULE(_rmi, m) {
         .def("contains", &ColumnIndex::contains, py::arg("key"))
         .def("range", &ColumnIndex::range, py::arg("lo"), py::arg("hi"))
         .def("range_query", &ColumnIndex::range_query, py::arg("op"), py::arg("value"))
+        // --- typed surface ---
+        .def("lookup", [](const ColumnIndex& self, py::handle value) {
+            return self.lookup(datum_from_py(value));
+        }, py::arg("value"),
+           "Every row whose value equals this one.\n\n"
+           "The general form of find(), and the only correct one for a column\n"
+           "that repeats values, where find() has no single row to point at.")
+        .def("query", [](const ColumnIndex& self, CompareOp op, py::handle value) {
+            return self.query(op, datum_from_py(value));
+        }, py::arg("op"), py::arg("value"),
+           "Rows matching a predicate, with the value typed to match the column.")
+        .def("query_range", [](const ColumnIndex& self, py::handle lo, py::handle hi) {
+            return self.query_range(datum_from_py(lo), datum_from_py(hi));
+        }, py::arg("lo"), py::arg("hi"), "Rows with values in [lo, hi].")
+        .def("query_prefix", &ColumnIndex::query_prefix, py::arg("prefix"),
+             "Rows whose value begins with `prefix`. String columns only.\n\n"
+             "Exact, byte-order, and a single leaf-chain walk. Impossible under\n"
+             "any integer encoding of the string, which is the clearest reason\n"
+             "to index strings as strings.")
+        .def("insert_row", [](ColumnIndex& self, py::handle value, std::int64_t row) {
+            return self.insert_row(datum_from_py(value), row);
+        }, py::arg("value"), py::arg("row"))
+        .def("erase_row", [](ColumnIndex& self, py::handle value, std::int64_t row) {
+            return self.erase_row(datum_from_py(value), row);
+        }, py::arg("value"), py::arg("row"),
+           "A composite key is (value, row), so the row id is required there:\n"
+           "a value alone names several rows and picking one would delete a\n"
+           "row the caller never named.")
         .def("plan", &ColumnIndex::plan)
         .def("validate", &ColumnIndex::validate)
         .def_property_readonly("kind", &ColumnIndex::kind)
+        .def_property_readonly("type", &ColumnIndex::type)
+        .def_property_readonly("encoding", &ColumnIndex::encoding)
+        .def_property_readonly("is_mutable", &ColumnIndex::is_mutable)
+        .def_property_readonly("is_native", &ColumnIndex::is_native,
+                               "Whether one key names at most one row. False\n"
+                               "for a composite encoding, where lookup() is the\n"
+                               "answer and find() returns None by design.")
         .def("__len__", &ColumnIndex::size)
         .def("__contains__", &ColumnIndex::contains)
         .def("__repr__", [](const ColumnIndex& self) {
             return std::string("ColumnIndex(kind=") +
                    hylis::index::to_string(self.kind()) +
+                   ", type=" + hylis::index::to_string(self.type()) +
+                   ", encoding=" + hylis::index::to_string(self.encoding()) +
                    ", size=" + std::to_string(self.size()) + ")";
         });
+
+    m.def("measure_plan_typed", &measure_typed_from_py,
+          py::arg("type"), py::arg("keys"), py::arg("values"), py::arg("plan"),
+          py::arg("write_fraction") = 0.0,
+          "Build one specific typed plan and time it in C++.\n\n"
+          "choose_index reports only the candidate that won, so measuring a\n"
+          "structure it rejected -- which is what an experiment comparing\n"
+          "families has to do -- needs this. Timed on the C++ side because a\n"
+          "pybind11 crossing costs ~1 us and a lookup costs a few ns.");
+
+    m.def("candidates_for", [](LogicalType type, const ColumnShape& shape,
+                               double write_fraction) {
+              Workload workload;
+              workload.write_fraction = write_fraction;
+              return hylis::index::candidates_for(type, shape, workload);
+          },
+          py::arg("type"), py::arg("shape"), py::arg("write_fraction") = 0.0,
+          "Which structures can serve this column at all.\n\n"
+          "Stage one of the choice, and a hard filter rather than a\n"
+          "preference: it runs before anything is built or timed, so the\n"
+          "expensive path is never spent on a structure that could not have\n"
+          "answered the query.");
+
+    m.def("measure_shape", [](const std::vector<ColumnKey>& keys,
+                              const std::vector<ColumnValue>& values) {
+              return hylis::index::measure_shape(keys, values);
+          }, py::arg("keys"), py::arg("values"),
+          "Rows, distinct values, uniqueness and monotonicity, in one pass.");
 
     // ------------------------------------------------------------- catalog
 
