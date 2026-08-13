@@ -94,8 +94,11 @@ def test_indexes_every_scalar_type(table):
     assert info.type == LogicalType.String
     assert info.distinct == 3
     assert not info.unique
-    # Three distinct values over 300 rows: duplicated, so composite.
-    assert info.encoding == KeyEncoding.Composite
+    # Three distinct values over 300 rows. Duplicated, so a native key is out --
+    # and low-cardinality enough that the bitmap is a candidate and wins on
+    # measurement, which is what the Dictionary encoding records.
+    assert info.kind == IndexKind.Bitmap
+    assert info.encoding == KeyEncoding.Dictionary
     assert info.rows == 300
     assert info.skipped == 0
 
@@ -113,15 +116,40 @@ def test_describe_has_a_row_per_declared_column(table):
     assert sum(1 for c in described if c.indexed) == 1
 
 
-def test_bool_and_vector_columns_are_refused_with_the_reason(tmp_path):
+def test_a_bool_column_gets_a_bitmap_and_nothing_else(tmp_path):
     store = RecordStore(str(tmp_path / "s"))
     schema = shop_schema()
     schema.add(ColumnDef("in_stock", LogicalType.Bool))
+    t = Table(store, schema)
+
+    rows = shop_rows(200)
+    for i, r in enumerate(rows):
+        # .set, not .columns[...] = ... -- reading .columns builds a new dict,
+        # so assigning into it mutates a temporary and is silently lost.
+        r.set("in_stock", "false" if i % 4 == 0 else "true")
+    t.put_batch(rows)
+
+    info = t.create_index("in_stock")
+    # Two distinct values: an ordered index over it is a sorted list of every
+    # row providing no ordering benefit, so the bitmap is the only candidate.
+    assert info.kind == IndexKind.Bitmap
+    assert info.encoding == KeyEncoding.Dictionary
+    assert info.distinct == 2
+
+    assert t.count("in_stock", PredOp.Eq, True) == 150
+    assert t.count("in_stock", PredOp.Eq, False) == 50
+    keys, _ = t.select_keys("in_stock", PredOp.Eq, False)
+    assert len(keys) == 50
+    assert all(k % 4 == 0 for k in keys)
+    t.validate()
+
+
+def test_a_vector_column_is_refused_with_the_reason(tmp_path):
+    store = RecordStore(str(tmp_path / "s"))
+    schema = shop_schema()
     schema.add(ColumnDef("embedding", LogicalType.Vector, 8))
     t = Table(store, schema)
 
-    with pytest.raises(ValueError, match="bitmap"):
-        t.create_index("in_stock")
     with pytest.raises(ValueError, match="put_vector"):
         t.create_index("embedding")
 
@@ -279,8 +307,16 @@ def test_an_unchanged_column_is_not_touched(table):
     table.create_index("category", write_fraction=0.3)
 
     same = table.get(5)
-    same.columns["title"] = "puma go"
+    # Genuinely change a column other than the indexed ones. Assigning into
+    # .columns would have changed nothing at all, which made an earlier version
+    # of this test pass without testing anything.
+    assert same.columns["title"] != "puma go"
+    same.set("title", "puma go")
     result = table.put(same)
+
+    assert table.get(5).columns["title"] == "puma go"
+    # price and category are unchanged, so neither index should have been
+    # erased and reinserted for no reason.
     assert result.indexes_touched == 0
     table.validate()
 
@@ -317,18 +353,24 @@ def test_a_natively_keyed_column_rebuilds_when_a_write_makes_it_non_unique(tmp_p
     # collides makes them not, and the tree overwrote the colliding row's entry
     # rather than storing both. Without the rebuild the index would silently be
     # missing a row.
+    # A thousand distinct values over a thousand rows puts the column above
+    # both bitmap thresholds, so the bitmap is not a candidate and the native
+    # key is guaranteed. At forty values the two were close enough that the
+    # winner varied between runs and so did this test.
     store = RecordStore(str(tmp_path / "s"))
     t = Table(store, shop_schema())
-    t.put_batch([Record(i, {"category": f"c{i}"}) for i in range(40)])
+    t.put_batch([Record(i, {"category": f"c{i}"}) for i in range(1000)])
     t.create_index("category", write_fraction=0.5)
     assert t.info("category").encoding == KeyEncoding.Native
 
-    result = t.put(Record(1000, {"category": "c7"}))
+    result = t.put(Record(100_000, {"category": "c7"}))
     assert result.rebuilds_triggered == 1
 
     keys, _ = t.select_keys("category", PredOp.Eq, "c7")
-    assert keys == [7, 1000]
-    assert t.info("category").encoding == KeyEncoding.Composite
+    assert keys == [7, 100_000]
+    # Which structure it landed on is a measurement outcome; what matters is
+    # that it is no longer one mapping a value to a single row.
+    assert t.info("category").encoding != KeyEncoding.Native
     t.validate()
 
 
@@ -459,3 +501,121 @@ def test_opening_without_a_stored_schema_says_what_is_missing(tmp_path):
     store = RecordStore(str(tmp_path / "empty"))
     with pytest.raises(RuntimeError, match="no schema"):
         Table.open(store)
+
+
+# ---------------------------------------------------------------------------
+# Conjunctions, disjunctions and counting
+# ---------------------------------------------------------------------------
+
+
+def bitmap_table(tmp_path, n=300):
+    store = RecordStore(str(tmp_path / "conj"))
+    schema = shop_schema()
+    schema.add(ColumnDef("in_stock", LogicalType.Bool))
+    t = Table(store, schema)
+    rows = shop_rows(n)
+    for i, r in enumerate(rows):
+        r.set("in_stock", "false" if i % 3 == 0 else "true")
+    t.put_batch(rows)
+    return t
+
+
+def test_a_conjunction_over_two_bitmaps_uses_the_and_path(tmp_path):
+    t = bitmap_table(tmp_path)
+    t.create_index("category")
+    t.create_index("in_stock")
+
+    keys, trace = t.select_all([("category", PredOp.Eq, "shoes"),
+                                ("in_stock", PredOp.Eq, True)])
+    want = sorted(r.key for r in t.scan()
+                  if r.columns["category"] == "shoes"
+                  and r.columns["in_stock"] == "true")
+    assert keys == want
+    assert "bitmap AND" in trace.reason
+
+
+def test_a_mixed_conjunction_falls_back_to_the_merge_and_agrees(tmp_path):
+    t = bitmap_table(tmp_path)
+    t.create_index("category")
+    t.create_index("price")
+
+    keys, trace = t.select_all([("category", PredOp.Eq, "shoes"),
+                                ("price", PredOp.Lt, 250)])
+    want = sorted(r.key for r in t.scan()
+                  if r.columns["category"] == "shoes"
+                  and int(r.columns["price"]) < 250)
+    assert keys == want
+    assert "sorted merge" in trace.reason
+
+
+def test_a_conjunction_containing_an_unindexable_operator_is_still_right(tmp_path):
+    t = bitmap_table(tmp_path)
+    t.create_index("category")
+    t.create_index("title")
+
+    keys, _ = t.select_all([("category", PredOp.Eq, "shoes"),
+                            ("title", PredOp.Contains, "ike")])
+    want = sorted(r.key for r in t.scan()
+                  if r.columns["category"] == "shoes"
+                  and "ike" in r.columns["title"])
+    assert keys == want
+
+
+def test_no_predicates_means_every_row(tmp_path):
+    t = bitmap_table(tmp_path, n=120)
+    keys, _ = t.select_all([])
+    assert keys == sorted(range(120))
+
+
+def test_an_impossible_conjunction_is_empty(tmp_path):
+    t = bitmap_table(tmp_path)
+    t.create_index("category")
+    t.create_index("price")
+    keys, _ = t.select_all([("category", PredOp.Eq, "socks"),
+                            ("price", PredOp.Lt, 250)])
+    assert keys == []
+
+
+def test_a_disjunction_is_the_deduplicated_union(tmp_path):
+    t = bitmap_table(tmp_path)
+    t.create_index("category")
+
+    keys, _ = t.select_any([("category", PredOp.Eq, "shoes"),
+                            ("category", PredOp.Eq, "hats")])
+    want = sorted(r.key for r in t.scan()
+                  if r.columns["category"] in ("shoes", "hats"))
+    assert keys == want
+    assert len(keys) == len(set(keys))
+
+
+def test_count_agrees_with_select_on_every_family(table):
+    table.create_index("category")   # low cardinality: a bitmap
+    table.create_index("price")      # wide: an ordered index
+
+    for value in CATEGORIES:
+        keys, _ = table.select_keys("category", PredOp.Eq, value)
+        assert table.count("category", PredOp.Eq, value) == len(keys), value
+    for probe in (0, 100, 250, 499, 9999):
+        keys, _ = table.select_keys("price", PredOp.Lt, probe)
+        assert table.count("price", PredOp.Lt, probe) == len(keys), probe
+
+
+def test_create_index_as_pins_the_family(tmp_path):
+    # choose_index times lookups, where a bitmap loses from about 64 distinct
+    # values upward -- so a column whose workload is counts or conjunctions
+    # cannot get one by asking nicely.
+    store = RecordStore(str(tmp_path / "pin"))
+    schema = Schema([ColumnDef("bucket", LogicalType.Int64)])
+    t = Table(store, schema)
+    t.put_batch([Record(i, {"bucket": str(i % 500)}) for i in range(5000)])
+
+    chosen = t.create_index("bucket")
+    forced = t.create_index_as("bucket", IndexKind.Bitmap)
+    assert forced.kind == IndexKind.Bitmap
+    assert forced.encoding == KeyEncoding.Dictionary
+    # Same answers either way; only the cost differs.
+    keys, _ = t.select_keys("bucket", PredOp.Lt, 100)
+    assert len(keys) == 1000
+    assert t.count("bucket", PredOp.Lt, 100) == 1000
+    t.validate()
+    assert chosen.name == "bucket"

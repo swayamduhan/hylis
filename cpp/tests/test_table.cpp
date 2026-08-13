@@ -141,8 +141,11 @@ TEST(TableBasics, IndexesEveryScalarTypeAndReportsWhatItChose) {
     EXPECT_EQ(info.type, LogicalType::String);
     EXPECT_EQ(info.distinct, 3u);
     EXPECT_FALSE(info.unique);
-    // Three distinct values over 300 rows: duplicated, so composite.
-    EXPECT_EQ(info.encoding, KeyEncoding::Composite);
+    // Three distinct values over 300 rows. Duplicated, so a native key is out
+    // -- and low-cardinality enough that the bitmap is a candidate and wins on
+    // measurement, which is what the Dictionary encoding records.
+    EXPECT_EQ(info.kind, IndexKind::Bitmap);
+    EXPECT_EQ(info.encoding, KeyEncoding::Dictionary);
     EXPECT_EQ(info.rows, 300u);
     EXPECT_EQ(info.skipped, 0u);
 
@@ -169,15 +172,42 @@ TEST(TableBasics, ADescribeRowExistsForEveryDeclaredColumn) {
     EXPECT_EQ(indexed, 1u) << "only the column with an index should say so";
 }
 
-TEST(TableBasics, BoolAndVectorColumnsAreRefusedWithTheReason) {
-    TempDir dir("refuse");
+TEST(TableBasics, ABoolColumnGetsABitmapAndNothingElse) {
+    TempDir dir("bool_column");
     RecordStore store(dir.str());
     Schema s = shop_schema();
     s.add(ColumnDef("in_stock", LogicalType::Bool));
+    Table table(store, std::move(s));
+
+    std::vector<Record> rows = shop_rows(200);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        rows[i].columns["in_stock"] = (i % 4 == 0) ? "false" : "true";
+    }
+    table.put_batch(rows);
+
+    const auto info = table.create_index("in_stock");
+    // Two distinct values: an ordered index over it is a sorted list of every
+    // row providing no ordering benefit, so the bitmap is the only candidate.
+    EXPECT_EQ(info.kind, IndexKind::Bitmap);
+    EXPECT_EQ(info.encoding, KeyEncoding::Dictionary);
+    EXPECT_EQ(info.distinct, 2u);
+
+    EXPECT_EQ(table.count(Predicate("in_stock", PredOp::Eq, Datum{true})), 150u);
+    EXPECT_EQ(table.count(Predicate("in_stock", PredOp::Eq, Datum{false})), 50u);
+    const auto in_stock =
+        table.select_keys(Predicate("in_stock", PredOp::Eq, Datum{false}));
+    EXPECT_EQ(in_stock.size(), 50u);
+    for (std::int64_t key : in_stock) EXPECT_EQ(key % 4, 0);
+    EXPECT_NO_THROW(table.validate());
+}
+
+TEST(TableBasics, AVectorColumnIsRefusedWithTheReason) {
+    TempDir dir("refuse_vector");
+    RecordStore store(dir.str());
+    Schema s = shop_schema();
     s.add(ColumnDef("embedding", LogicalType::Vector, 8));
     Table table(store, std::move(s));
 
-    EXPECT_THROW(table.create_index("in_stock"), std::invalid_argument);
     EXPECT_THROW(table.create_index("embedding"), std::invalid_argument);
 }
 
@@ -543,8 +573,12 @@ TEST(TableWrites, ANativelyKeyedColumnRebuildsWhenAWriteMakesItNonUnique) {
     RecordStore store(dir.str());
     Table table(store, shop_schema());
 
+    // A thousand distinct values over a thousand rows puts the column above
+    // both bitmap thresholds, so the bitmap is not a candidate and the native
+    // key is guaranteed. At forty values the two were close enough that the
+    // winner varied between runs and so did this test.
     std::vector<Record> rows;
-    for (int i = 0; i < 40; ++i) {
+    for (int i = 0; i < 1000; ++i) {
         Record r(i);
         r.columns["category"] = "c" + std::to_string(i);  // all distinct
         rows.push_back(r);
@@ -553,16 +587,18 @@ TEST(TableWrites, ANativelyKeyedColumnRebuildsWhenAWriteMakesItNonUnique) {
     table.create_index("category", Workload{0.5});
     ASSERT_EQ(table.info("category").encoding, KeyEncoding::Native);
 
-    Record collide(1000);
+    Record collide(100000);
     collide.columns["category"] = "c7";  // now two rows share a value
     const auto result = table.put(collide);
     EXPECT_EQ(result.rebuilds_triggered, 1u);
 
-    // After the rebuild the column is composite and both rows are findable.
+    // After the rebuild both rows are findable. Which structure it landed on
+    // is a measurement outcome and not asserted; what matters is that it is no
+    // longer one that maps a value to a single row.
     const auto rows_with_c7 =
         table.select_keys(Predicate("category", PredOp::Eq, Datum{std::string("c7")}));
-    EXPECT_EQ(rows_with_c7, (std::vector<std::int64_t>{7, 1000}));
-    EXPECT_EQ(table.info("category").encoding, KeyEncoding::Composite);
+    EXPECT_EQ(rows_with_c7, (std::vector<std::int64_t>{7, 100000}));
+    EXPECT_NE(table.info("category").encoding, KeyEncoding::Native);
     EXPECT_NO_THROW(table.validate());
 }
 
@@ -818,4 +854,188 @@ TEST(TableReopen, OpeningWithoutAStoredSchemaSaysWhatIsMissing) {
     TempDir dir("no_schema");
     RecordStore store(dir.str());
     EXPECT_THROW(Table::open(store), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// Conjunctions and disjunctions
+// ---------------------------------------------------------------------------
+//
+// The planner took a single predicate on the grounds that two are set
+// intersection and introduce no new decision. Bitmaps made that false: a
+// word-parallel AND costs n/64 words whatever matches, where a sorted merge
+// costs O(m1 + m2). So there is now a strategy to choose, and these check that
+// both strategies return the same rows -- which is what makes the choice a
+// performance decision rather than a semantic one.
+
+TEST(TableConjunctions, EveryStrategyAgreesWithAFullScan) {
+    TempDir dir("conj");
+    RecordStore store(dir.str());
+    Schema s = shop_schema();
+    s.add(ColumnDef("in_stock", LogicalType::Bool));
+    Table table(store, std::move(s));
+
+    std::vector<Record> rows = shop_rows(400);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        rows[i].columns["in_stock"] = (i % 3 == 0) ? "false" : "true";
+    }
+    table.put_batch(rows);
+    table.create_index("category");
+    table.create_index("in_stock");
+    table.create_index("price");
+
+    // Two bitmap columns: the AND path.
+    QueryTrace trace;
+    const std::vector<Predicate> both = {
+        Predicate("category", PredOp::Eq, Datum{std::string("shoes")}),
+        Predicate("in_stock", PredOp::Eq, Datum{true})};
+
+    std::set<std::int64_t> want;
+    for (const Record& r : store.records()) {
+        if (r.get("category") == "shoes" && r.get("in_stock") == "true") {
+            want.insert(r.key);
+        }
+    }
+    const auto got = table.select_all(both, &trace);
+    EXPECT_EQ(keys_of(got), want);
+    EXPECT_TRUE(std::is_sorted(got.begin(), got.end()));
+    EXPECT_NE(trace.reason.find("bitmap AND"), std::string::npos) << trace.reason;
+
+    // One bitmap and one ordered column: the merge path, and the same answer.
+    const std::vector<Predicate> mixed = {
+        Predicate("category", PredOp::Eq, Datum{std::string("shoes")}),
+        Predicate("price", PredOp::Lt, Datum{std::int64_t{250}})};
+
+    std::set<std::int64_t> want_mixed;
+    for (const Record& r : store.records()) {
+        if (r.get("category") == "shoes" && std::stoll(r.get("price")) < 250) {
+            want_mixed.insert(r.key);
+        }
+    }
+    const auto got_mixed = table.select_all(mixed, &trace);
+    EXPECT_EQ(keys_of(got_mixed), want_mixed);
+    EXPECT_NE(trace.reason.find("sorted merge"), std::string::npos) << trace.reason;
+}
+
+TEST(TableConjunctions, AnUnindexableOperatorStillParticipates) {
+    // `Contains` cannot be pushed to any index, so a conjunction containing it
+    // has to fall back to the merge -- and still be right.
+    TempDir dir("conj_scan");
+    RecordStore store(dir.str());
+    Table table(store, shop_schema());
+    table.put_batch(shop_rows(300));
+    table.create_index("category");
+    table.create_index("title");
+
+    const std::vector<Predicate> mixed = {
+        Predicate("category", PredOp::Eq, Datum{std::string("shoes")}),
+        Predicate("title", PredOp::Contains, Datum{std::string("ike")})};
+
+    std::set<std::int64_t> want;
+    for (const Record& r : store.records()) {
+        if (r.get("category") == "shoes" &&
+            r.get("title").find("ike") != std::string::npos) {
+            want.insert(r.key);
+        }
+    }
+    EXPECT_EQ(keys_of(table.select_all(mixed)), want);
+}
+
+TEST(TableConjunctions, ThreePredicatesAgreeWithAScan) {
+    TempDir dir("conj3");
+    RecordStore store(dir.str());
+    Schema s = shop_schema();
+    s.add(ColumnDef("in_stock", LogicalType::Bool));
+    Table table(store, std::move(s));
+
+    std::vector<Record> rows = shop_rows(500);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        rows[i].columns["in_stock"] = (i % 5 == 0) ? "false" : "true";
+    }
+    table.put_batch(rows);
+    for (const char* c : {"category", "in_stock", "price", "title"}) {
+        table.create_index(c);
+    }
+
+    const std::vector<Predicate> three = {
+        Predicate("category", PredOp::Eq, Datum{std::string("bags")}),
+        Predicate("in_stock", PredOp::Eq, Datum{true}),
+        Predicate("price", PredOp::Ge, Datum{std::int64_t{100}})};
+
+    std::set<std::int64_t> want;
+    for (const Record& r : store.records()) {
+        if (r.get("category") == "bags" && r.get("in_stock") == "true" &&
+            std::stoll(r.get("price")) >= 100) {
+            want.insert(r.key);
+        }
+    }
+    EXPECT_EQ(keys_of(table.select_all(three)), want);
+}
+
+TEST(TableConjunctions, AnEmptyResultStopsEarlyAndStaysEmpty) {
+    TempDir dir("conj_empty");
+    RecordStore store(dir.str());
+    Table table(store, shop_schema());
+    table.put_batch(shop_rows(200));
+    table.create_index("category");
+    table.create_index("price");
+
+    const std::vector<Predicate> impossible = {
+        Predicate("category", PredOp::Eq, Datum{std::string("socks")}),
+        Predicate("price", PredOp::Lt, Datum{std::int64_t{250}})};
+    EXPECT_TRUE(table.select_all(impossible).empty());
+}
+
+TEST(TableConjunctions, NoPredicatesMeansEveryRow) {
+    TempDir dir("conj_none");
+    RecordStore store(dir.str());
+    Table table(store, shop_schema());
+    table.put_batch(shop_rows(120));
+
+    const auto all = table.select_all({});
+    EXPECT_EQ(all.size(), 120u);
+    EXPECT_TRUE(std::is_sorted(all.begin(), all.end()));
+}
+
+TEST(TableConjunctions, DisjunctionIsTheUnion) {
+    TempDir dir("disj");
+    RecordStore store(dir.str());
+    Table table(store, shop_schema());
+    table.put_batch(shop_rows(300));
+    table.create_index("category");
+
+    const std::vector<Predicate> either = {
+        Predicate("category", PredOp::Eq, Datum{std::string("shoes")}),
+        Predicate("category", PredOp::Eq, Datum{std::string("hats")})};
+
+    std::set<std::int64_t> want;
+    for (const Record& r : store.records()) {
+        const std::string c = r.get("category");
+        if (c == "shoes" || c == "hats") want.insert(r.key);
+    }
+    const auto got = table.select_any(either);
+    EXPECT_EQ(keys_of(got), want);
+    EXPECT_TRUE(std::is_sorted(got.begin(), got.end()));
+    // No row counted twice, which a naive concatenation would do.
+    EXPECT_EQ(got.size(), want.size());
+}
+
+TEST(TableCounting, CountGoesThroughTheIndexAndAgreesWithSelect) {
+    TempDir dir("count");
+    RecordStore store(dir.str());
+    Table table(store, shop_schema());
+    table.put_batch(shop_rows(400));
+    table.create_index("category");
+    table.create_index("price");
+
+    QueryTrace trace;
+    for (const char* c : kCategories) {
+        const Predicate p("category", PredOp::Eq, Datum{std::string(c)});
+        const std::size_t counted = table.count(p, &trace);
+        EXPECT_EQ(counted, table.select_keys(p).size()) << c;
+        EXPECT_TRUE(trace.used_index) << c;
+    }
+    for (std::int64_t probe : {0, 100, 250, 499, 9999}) {
+        const Predicate p("price", PredOp::Lt, Datum{probe});
+        EXPECT_EQ(table.count(p), table.select_keys(p).size()) << probe;
+    }
 }

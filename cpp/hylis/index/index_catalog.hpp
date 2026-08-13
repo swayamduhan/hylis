@@ -298,7 +298,8 @@ public:
                                    const std::vector<T>& keys,
                                    const std::vector<ColumnValue>& values,
                                    Workload workload = Workload{},
-                                   Decision* decision = nullptr) {
+                                   Decision* decision = nullptr,
+                                   const std::vector<ColumnValue>* row_space = nullptr) {
         Decision out;
         const ColumnShape shape = measure_shape(keys, values);
         out.freshness = freshness_typed(column, keys.size(), shape.distinct);
@@ -326,8 +327,8 @@ public:
 
         if (usable && out.freshness == Freshness::Fresh) {
             out.action = Action::Replayed;
-            ColumnIndex index =
-                ColumnIndex::build_typed_with(type, keys, values, *stored);
+            ColumnIndex index = ColumnIndex::build_typed_with(
+                type, keys, values, *stored, row_space);
             set(column, index.plan());
             if (decision) *decision = out;
             return index;
@@ -345,8 +346,8 @@ public:
                 replayed.ns_per_lookup <= stored->ns_per_lookup * retune_factor_;
             if (still_good) {
                 out.action = Action::Replayed;
-                ColumnIndex index =
-                    ColumnIndex::build_typed_with(type, keys, values, *stored);
+                ColumnIndex index = ColumnIndex::build_typed_with(
+                    type, keys, values, *stored, row_space);
                 set(column, index.plan());
                 if (decision) *decision = out;
                 return index;
@@ -355,7 +356,8 @@ public:
         }
 
         ColumnIndex index = ColumnIndex::build_typed(
-            type, keys, values, std::numeric_limits<std::size_t>::max(), workload);
+            type, keys, values, std::numeric_limits<std::size_t>::max(), workload,
+            row_space);
         set(column, index.plan());
         if (decision) *decision = out;
         return index;

@@ -61,6 +61,28 @@ Predicate predicate_from_py(const std::string& column, PredOp op,
     return p;
 }
 
+// A list of (column, op, value[, value2]) tuples.
+//
+// Tuples rather than a bound Predicate class: a conjunction is written inline
+// at the call site far more often than it is held, and `[("a", Eq, 1)]` reads
+// better there than three constructor calls.
+std::vector<Predicate> predicates_from_py(const py::list& items) {
+    std::vector<Predicate> out;
+    out.reserve(items.size());
+    for (const py::handle item : items) {
+        const py::sequence parts = py::reinterpret_borrow<py::sequence>(item);
+        if (parts.size() < 3 || parts.size() > 4) {
+            throw std::invalid_argument(
+                "each predicate must be (column, op, value) or "
+                "(column, op, value, value2)");
+        }
+        out.push_back(predicate_from_py(
+            parts[0].cast<std::string>(), parts[1].cast<PredOp>(), parts[2],
+            parts.size() == 4 ? parts[3] : py::none()));
+    }
+    return out;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(_table, m) {
@@ -181,6 +203,19 @@ PYBIND11_MODULE(_table, m) {
            "the static RMI wins nearly everything, so without it that\n"
            "build-only structure would be chosen for columns about to be\n"
            "written to, which then cost a rebuild on the first write.")
+        .def("create_index_as", [](Table& self, const std::string& name,
+                                   hylis::index::IndexKind kind,
+                                   double write_fraction) {
+            Workload workload;
+            workload.write_fraction = write_fraction;
+            return self.create_index_as(name, kind, workload);
+        }, py::arg("column"), py::arg("kind"), py::arg("write_fraction") = 0.0,
+           "Build a named structure, skipping the measurement.\n\n"
+           "choose_index times lookups and writes and nothing else, so a\n"
+           "column whose workload is dominated by count() or by conjunctions\n"
+           "is judged on the one thing a bitmap is worst at. This is how an\n"
+           "experiment gets the family it wants to compare, and how a user who\n"
+           "knows their query mix overrides a lookup benchmark.")
         .def("drop_index", &Table::drop_index, py::arg("column"))
         .def("has_index", &Table::has_index, py::arg("column"))
         .def("describe", &Table::describe)
@@ -235,7 +270,33 @@ PYBIND11_MODULE(_table, m) {
                          py::handle value, py::handle value2) {
             return self.count(predicate_from_py(column, op, value, value2));
         }, py::arg("column"), py::arg("op"), py::arg("value") = py::none(),
-           py::arg("value2") = py::none())
+           py::arg("value2") = py::none(),
+           "How many rows match, without producing them.\n\n"
+           "A bitmap column answers by popcount over n/64 words; every other\n"
+           "family builds the row list and measures it.")
+        .def("select_all", [](const Table& self, const py::list& predicates) {
+            QueryTrace trace;
+            auto keys = self.select_all(predicates_from_py(predicates), &trace);
+            return py::make_tuple(std::move(keys), trace);
+        }, py::arg("predicates"),
+           "Record keys matching every predicate, ascending, with the trace.\n\n"
+           "Each predicate is a (column, op, value[, value2]) tuple. When all\n"
+           "of them are served by bitmap columns over the same rows this is a\n"
+           "word-parallel AND touching n/64 words whatever matches; otherwise\n"
+           "it is a sorted merge, most selective predicate first. The trace\n"
+           "says which ran.")
+        .def("select_all_records", [](const Table& self, const py::list& predicates) {
+            QueryTrace trace;
+            auto rows = self.select_all_records(predicates_from_py(predicates),
+                                                &trace);
+            return py::make_tuple(std::move(rows), trace);
+        }, py::arg("predicates"))
+        .def("select_any", [](const Table& self, const py::list& predicates) {
+            QueryTrace trace;
+            auto keys = self.select_any(predicates_from_py(predicates), &trace);
+            return py::make_tuple(std::move(keys), trace);
+        }, py::arg("predicates"),
+           "Record keys matching any predicate, ascending and deduplicated.")
         .def("scan", &Table::scan, py::arg("limit") = 0, py::arg("offset") = 0)
 
         // --- persistence ---

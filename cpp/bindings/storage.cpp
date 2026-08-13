@@ -33,6 +33,21 @@ PYBIND11_MODULE(_storage, m) {
              },
              py::arg("name"), py::arg("default") = std::string{},
              "Get a column value, returning default if absent.")
+        // Necessary, not sugar.
+        //
+        // `record.columns` converts the C++ map to a *new* Python dict on every
+        // read, so `record.columns["price"] = "40"` mutates a temporary and is
+        // silently lost. That has already made one test vacuous. This is the
+        // way to change a column in place.
+        .def("set", [](Record& r, const std::string& name,
+                       const std::string& value) { r.columns[name] = value; },
+             py::arg("name"), py::arg("value"),
+             "Set one column. Use this rather than assigning into .columns,\n"
+             "which returns a copy.")
+        .def("unset", [](Record& r, const std::string& name) {
+                 return r.columns.erase(name) > 0;
+             },
+             py::arg("name"), "Remove one column. Returns True if it was there.")
         .def("__repr__", [](const Record& r) {
             return "Record(key=" + std::to_string(r.key) + ", columns="
                    + std::to_string(r.columns.size()) + " cols)";

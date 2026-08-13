@@ -407,6 +407,11 @@ PYBIND11_MODULE(_rmi, m) {
         .value("BPlusTree", IndexKind::BPlusTree)
         .value("RMI", IndexKind::RMI,
                "Build-only. A legal answer for a read-only column and no other.")
+        .value("Bitmap", IndexKind::Bitmap,
+               "Dictionary plus one bitmap per distinct value. For columns\n"
+               "with few distinct values, where an ordered index's ordering\n"
+               "does no work -- and the only family that answers count()\n"
+               "without materialising a row id.")
         .value("DynamicRMI", IndexKind::DynamicRMI,
                "The learned index made writable: an immutable RMI over a delta\n"
                "buffer, with deletions tombstoned.");
@@ -543,6 +548,20 @@ PYBIND11_MODULE(_rmi, m) {
         .def("query_range", [](const ColumnIndex& self, py::handle lo, py::handle hi) {
             return self.query_range(datum_from_py(lo), datum_from_py(hi));
         }, py::arg("lo"), py::arg("hi"), "Rows with values in [lo, hi].")
+        .def("count", [](const ColumnIndex& self, CompareOp op, py::handle value) {
+            return self.count(op, datum_from_py(value));
+        }, py::arg("op"), py::arg("value"),
+           "How many rows match, without producing them.\n\n"
+           "A bitmap answers by popcount over n/64 words and materialises\n"
+           "nothing. Every other family builds the row list and measures it,\n"
+           "which for a permissive predicate is the whole cost of the query\n"
+           "paid to learn one number.")
+        .def_property_readonly("has_bitmap", &ColumnIndex::has_bitmap,
+                               "Whether this column can hand out a bit set for\n"
+                               "combining with another predicate.")
+        .def_property_readonly("row_space", &ColumnIndex::row_space,
+                               "Rows this index has positions for. Two bitmaps\n"
+                               "are combinable only if these agree.")
         .def("query_prefix", &ColumnIndex::query_prefix, py::arg("prefix"),
              "Rows whose value begins with `prefix`. String columns only.\n\n"
              "Exact, byte-order, and a single leaf-chain walk. Impossible under\n"

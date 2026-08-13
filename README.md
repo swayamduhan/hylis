@@ -23,7 +23,7 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 | 6 | Neural Router       | ✅ |
 | 7 | Incremental retrain | ✅ |
 | 8 | Query planner       | ✅ |
-| 9 | Typed columns       | ◐ phases A–B of 5 |
+| 9 | Typed columns       | ◐ phases A–C of 5 |
 | 10| Benchmarks          | ☐ |
 | 11| Demo CLI            | ☐ |
 
@@ -71,11 +71,11 @@ tiebreak.
 
 | | B+ tree | RMI / DynamicRMI | Bitmap | HNSW / routed / flat |
 |---|---|---|---|---|
-| `Int64` | ✅ | ✅ | phase C | — |
-| `Double` | ✅ | ✅ | phase C | — |
+| `Int64` | ✅ | ✅ | ✅ if low-cardinality | — |
+| `Double` | ✅ | ✅ | ✅ if low-cardinality | — |
 | `Timestamp` | ✅ | ✅ | — | — |
-| `String` | ✅ **native** | ❌ structurally | phase C | — |
-| `Bool` | ❌ pointless | ❌ | phase C | — |
+| `String` | ✅ **native** | ❌ structurally | ✅ if low-cardinality | — |
+| `Bool` | ❌ pointless | ❌ | ✅ **only option** | — |
 | `Vector` | ❌ | ❌ | ❌ | ✅ |
 
 The ❌ in `String` × RMI is a fact about learned indexes rather than a
@@ -157,6 +157,40 @@ to a rebuild, and it **self-corrects**: the first write that breaks uniqueness
 makes the stored plan illegal for the data, so the column is re-chosen onto a
 mutable structure and never rebuilds again. `put_batch` turns those n rebuilds
 into one — measured at 40 versus 1.
+
+## Bitmaps, and counting without looking
+
+An ordered index answers "where is this key". For a column of three categories
+that is the wrong question — the answer is a quarter of the table, and locating
+it was never the hard part. A dictionary-encoded bitmap stores one `n`-bit map
+per distinct value, so equality is one bitmap, a range is an OR over a
+contiguous run of them, a conjunction is a word-parallel AND, and **cardinality
+is a popcount**.
+
+```python
+table.count("in_stock", PredOp.Eq, True)          # popcount; no row produced
+table.select_all([("category", PredOp.Eq, "shoes"),
+                  ("in_stock", PredOp.Eq, True)])  # bitmap AND
+```
+
+```bash
+python scripts/experiment_bitmap_cardinality.py   # E2: where it stops winning
+python scripts/experiment_conjunction.py          # E4: AND vs sorted merge
+```
+
+**E2.** The memory crossover is **1,024 distinct values**, identical across
+uniform and skewed data and across integer and string keys — so that is what
+the candidate filter uses. `count()` never crosses: **72×** faster on integer
+keys and **356×** on skewed string keys, because the bitmap counts by popcount
+while the tree pays for every row id it produces and then discards.
+
+**E4.** Bitmap AND beats a sorted merge by 4.5×–8.3× above ~0.1% selectivity,
+and the margin grows with selectivity because its cost is flat and the merge's
+is not. Below that almost nothing matches and the merge wins.
+
+One honest gap, and it is why `create_index_as` exists: `choose_index` times
+lookups and writes, not `count()`, so a counting workload is judged on the one
+operation the bitmap is worst at.
 
 ### The framing these add up to
 

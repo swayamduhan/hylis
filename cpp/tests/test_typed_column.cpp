@@ -67,6 +67,23 @@ void categories(std::vector<std::string>* values, std::vector<ColumnValue>* rows
     }
 }
 
+// Build with the composite encoding, whatever choose_index would have picked.
+//
+// These tests are about the composite structure, and a low-cardinality column
+// is now also a bitmap candidate -- so letting the selector decide would make
+// them pass or fail on which candidate won a timing race that day. Pinning the
+// plan is what makes them tests of the encoding rather than of the selector.
+template <typename T>
+ColumnIndex composite_column(LogicalType type, const std::vector<T>& keys,
+                             const std::vector<ColumnValue>& rows) {
+    IndexPlan plan;
+    plan.kind = IndexKind::BPlusTree;
+    plan.type = type;
+    plan.encoding = KeyEncoding::Composite;
+    plan.btree_order = 32;
+    return ColumnIndex::build_typed_with(type, keys, rows, plan);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -159,7 +176,7 @@ TEST(CompositeEncoding, DuplicatedValuesAreIndexableAndEveryOperatorIsExact) {
     std::vector<ColumnValue> rows;
     categories(&values, &rows);
 
-    const ColumnIndex c = ColumnIndex::build_typed(LogicalType::String, values, rows);
+    const ColumnIndex c = composite_column(LogicalType::String, values, rows);
 
     EXPECT_EQ(c.encoding(), KeyEncoding::Composite);
     EXPECT_FALSE(c.is_native());
@@ -180,7 +197,7 @@ TEST(CompositeEncoding, FindHasNothingToPointAtAndSaysSo) {
     std::vector<std::string> values;
     std::vector<ColumnValue> rows;
     categories(&values, &rows);
-    const ColumnIndex c = ColumnIndex::build_typed(LogicalType::String, values, rows);
+    const ColumnIndex c = composite_column(LogicalType::String, values, rows);
 
     // Four rows hold "shoes". Returning one of them would be a guess, so the
     // caller is steered to lookup() by a null rather than by a coin toss.
@@ -195,7 +212,7 @@ TEST(CompositeEncoding, BoundsStayExactAtTheExtremeRowIds) {
     const std::vector<std::string> values = {"v", "v"};
     const std::vector<ColumnValue> rows = {std::numeric_limits<ColumnValue>::min(),
                                            std::numeric_limits<ColumnValue>::max()};
-    const ColumnIndex c = ColumnIndex::build_typed(LogicalType::String, values, rows);
+    const ColumnIndex c = composite_column(LogicalType::String, values, rows);
 
     EXPECT_EQ(c.lookup(Datum{std::string("v")}).size(), 2u);
     EXPECT_EQ(c.query(CompareOp::Le, Datum{std::string("v")}).size(), 2u);
@@ -206,12 +223,12 @@ TEST(CompositeEncoding, BoundsStayExactAtTheExtremeRowIds) {
 
 TEST(CompositeEncoding, ErasingNeedsTheRowIdBecauseTheKeyContainsIt) {
     std::vector<std::string> values = {"a", "a", "b"};
-    ColumnIndex c = ColumnIndex::build_typed(LogicalType::String, values, identity(3));
+    ColumnIndex c = composite_column(LogicalType::String, values, identity(3));
 
     // The value alone names two rows, so the value-only overload refuses.
     ColumnIndex byvalue =
-        ColumnIndex::build_typed(LogicalType::Int64, std::vector<ColumnKey>{1, 1, 2},
-                                 identity(3));
+        composite_column(LogicalType::Int64, std::vector<ColumnKey>{1, 1, 2},
+                         identity(3));
     ASSERT_FALSE(byvalue.is_native());
     EXPECT_THROW(byvalue.erase(1), std::invalid_argument);
 
@@ -244,7 +261,7 @@ TEST(CompositeEncoding, InsertsAndErasesAgreeWithAMultimapOracle) {
         oracle.emplace(k, v);
     }
 
-    ColumnIndex c = ColumnIndex::build_typed(LogicalType::Int64, keys, rows);
+    ColumnIndex c = composite_column(LogicalType::Int64, keys, rows);
     ASSERT_EQ(c.encoding(), KeyEncoding::Composite);
 
     // A mixed write stream over the same structure and the same oracle.
@@ -297,7 +314,7 @@ TEST(CompositeEncoding, EveryOperatorAgreesWithAMultimapOracle) {
         oracle.emplace(k, v);
     }
 
-    const ColumnIndex c = ColumnIndex::build_typed(LogicalType::Int64, keys, rows);
+    const ColumnIndex c = composite_column(LogicalType::Int64, keys, rows);
     ASSERT_EQ(c.encoding(), KeyEncoding::Composite);
 
     for (ColumnKey probe = -2; probe <= 42; ++probe) {
@@ -396,9 +413,18 @@ TEST(CandidateFilter, DuplicatesDisqualifyTheLearnedIndexEvenWhenNumeric) {
     shape.unique = false;
 
     const auto candidates = candidates_for(LogicalType::Int64, shape, Workload{});
-    ASSERT_EQ(candidates.size(), 1u);
-    EXPECT_EQ(candidates.front().kind, IndexKind::BPlusTree);
-    EXPECT_EQ(candidates.front().encoding, KeyEncoding::Composite);
+    ASSERT_FALSE(candidates.empty());
+    for (const IndexPlan& p : candidates) {
+        EXPECT_NE(p.kind, IndexKind::RMI);
+        EXPECT_NE(p.kind, IndexKind::DynamicRMI);
+        // Nor a native key, which maps one value to one row.
+        EXPECT_NE(p.encoding, KeyEncoding::Native);
+    }
+    // 40 distinct values is few enough that the bitmap is offered alongside
+    // the composite tree; which of the two wins is measured, not asserted.
+    bool saw_tree = false;
+    for (const IndexPlan& p : candidates) saw_tree |= p.kind == IndexKind::BPlusTree;
+    EXPECT_TRUE(saw_tree);
 }
 
 TEST(CandidateFilter, AWritableColumnIsStillNeverOfferedTheStaticRmi) {

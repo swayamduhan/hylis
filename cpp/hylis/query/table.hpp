@@ -41,15 +41,18 @@
 // after the insertion point and the only repair is a full column rebuild. E3
 // measured that encoding against composite keys and it lost, so the rebuild
 // path it needed is gone with it. What remains of the lazy-rebuild machinery
-// serves exactly two cases, both of which are a structure being asked for
-// something it cannot do:
+// serves three cases, each a structure being asked for something it cannot do:
 //
 //   * a column holding a **static RMI**, which is build-only, being written to
 //   * a column keyed **natively** (chosen because its values were unique)
 //     receiving a write that makes them non-unique
+//   * a **bitmap** column receiving a row whose key lands mid-table, which
+//     would shift every position after it and invalidate every bitmap at once
 //
-// Both mark the column dirty and rebuild it on the next read, and both are
-// counted in WriteResult so the cost is reported rather than hidden.
+// All three mark the column dirty and rebuild it on the next read, and all
+// three are counted in WriteResult so the cost is reported rather than hidden.
+// None of them is detected here: ScalarIndex::insert returns false when it
+// cannot represent the result, and that one answer covers all three.
 
 #pragma once
 
@@ -199,6 +202,31 @@ public:
         return info_of(name, def, column);
     }
 
+    // Build a named structure, skipping the measurement that would have
+    // chosen one.
+    //
+    // Exists because choose_index times lookups and writes and nothing else,
+    // so a column whose workload is dominated by count() or by conjunctions is
+    // judged on the one thing the bitmap is worst at — it decodes a whole
+    // matching set where a tree walks a leaf run. An experiment comparing the
+    // families therefore cannot get a bitmap by asking nicely, and neither can
+    // a user who knows their query mix better than a lookup benchmark does.
+    //
+    // The plan is still measured after the fact, so info() reports what this
+    // structure actually costs rather than what it was hoped to.
+    ColumnInfo create_index_as(const std::string& name, IndexKind kind,
+                               Workload workload = Workload{}) {
+        const ColumnDef& def = schema_.column(name);
+        reject_unindexable(def);
+
+        Column& column = columns_[name];
+        column.workload = workload;
+        column.forced = kind;
+        column.force = true;
+        build(name, def, &column);
+        return info_of(name, def, column);
+    }
+
     bool drop_index(const std::string& name) {
         // The column stays queryable — by scanning, which the trace reports.
         catalog_.erase(name);
@@ -338,14 +366,113 @@ public:
         return out;
     }
 
-    // Matching rows, without fetching them.
+    // How many rows match, without producing them.
     //
-    // Materialises the key list today, so it saves only the record fetch. A
-    // bitmap column answers this by popcount without materialising anything,
-    // which is the asymmetry phase C is built on — the signature is here now
-    // so that change is invisible to callers.
-    std::size_t count(const Predicate& predicate) const {
-        return select_keys(predicate).size();
+    // A bitmap column answers by popcount over n/64 words and materialises
+    // nothing; the tree and the learned index have to build the row list and
+    // then measure it, which for a permissive predicate is the entire cost of
+    // the query paid to learn one number. Both go through the same call, which
+    // is the point of hiding the structure.
+    std::size_t count(const Predicate& predicate,
+                      QueryTrace* trace = nullptr) const {
+        const ColumnDef& def = schema_.column(predicate.column);
+        if (op_is_indexable(predicate.op) && predicate.op != PredOp::Between &&
+            predicate.op != PredOp::Prefix) {
+            const auto it = columns_.find(predicate.column);
+            if (it != columns_.end() && it->second.index) {
+                ensure_fresh(predicate.column);
+                if (trace) {
+                    trace->used_index = true;
+                    trace->reason =
+                        std::string("counted through the index on '") +
+                        predicate.column + "'";
+                }
+                const std::size_t matched = it->second.index->count(
+                    compare_op_of(predicate.op), predicate.value);
+                if (trace) trace->matched = matched;
+                return matched;
+            }
+        }
+        (void)def;
+        return select_keys(predicate, trace).size();
+    }
+
+    // --- conjunctions -------------------------------------------------------
+    //
+    // Record keys matching **every** predicate, ascending.
+    //
+    // The planner deliberately took a single predicate, on the grounds that
+    // two are set intersection over row-id lists and introduce no new
+    // decision. Bitmaps made that false: when both operands are bitmap columns
+    // over the same rows, the intersection is a word-parallel AND that touches
+    // n/64 words *regardless of how many rows match*, where a sorted merge
+    // costs O(m1 + m2). Which is cheaper is now a question, and
+    // scripts/experiment_conjunction.py answers it.
+    std::vector<std::int64_t> select_all(const std::vector<Predicate>& predicates,
+                                         QueryTrace* trace = nullptr) const {
+        QueryTrace local;
+        if (predicates.empty()) {
+            local.reason = "no predicates; every row matches";
+            std::vector<std::int64_t> all = store_->keys();
+            std::sort(all.begin(), all.end());
+            local.matched = all.size();
+            if (trace) *trace = local;
+            return all;
+        }
+        if (predicates.size() == 1) {
+            return select_keys(predicates.front(), trace);
+        }
+
+        std::vector<std::int64_t> keys;
+        if (bitmap_conjunction(predicates, &keys, &local)) {
+            local.matched = keys.size();
+            if (trace) *trace = local;
+            return keys;
+        }
+
+        // Sorted merge, smallest first. Executing the most selective predicate
+        // first bounds every later intersection by its result, so the order is
+        // not cosmetic — and knowing which is most selective is free for a
+        // bitmap column and costs a full execution for any other.
+        keys = merge_conjunction(predicates, &local);
+        local.matched = keys.size();
+        if (trace) *trace = local;
+        return keys;
+    }
+
+    std::vector<storage::Record> select_all_records(
+        const std::vector<Predicate>& predicates,
+        QueryTrace* trace = nullptr) const {
+        const std::vector<std::int64_t> keys = select_all(predicates, trace);
+        std::vector<storage::Record> out;
+        out.reserve(keys.size());
+        for (std::int64_t key : keys) {
+            if (const storage::Record* r = store_->get(key)) out.push_back(*r);
+        }
+        return out;
+    }
+
+    // Record keys matching **any** predicate, ascending.
+    std::vector<std::int64_t> select_any(const std::vector<Predicate>& predicates,
+                                         QueryTrace* trace = nullptr) const {
+        QueryTrace local;
+        std::vector<std::int64_t> out;
+        for (const Predicate& p : predicates) {
+            QueryTrace one;
+            const std::vector<std::int64_t> keys = select_keys(p, &one);
+            local.scanned += one.scanned;
+            local.used_index = local.used_index || one.used_index;
+            std::vector<std::int64_t> merged;
+            merged.reserve(out.size() + keys.size());
+            std::set_union(out.begin(), out.end(), keys.begin(), keys.end(),
+                           std::back_inserter(merged));
+            out = std::move(merged);
+        }
+        local.reason = "union of " + std::to_string(predicates.size()) +
+                       " predicates";
+        local.matched = out.size();
+        if (trace) *trace = local;
+        return out;
     }
 
     std::vector<storage::Record> scan(std::size_t limit = 0,
@@ -431,6 +558,9 @@ private:
     struct Column {
         std::unique_ptr<ColumnIndex> index;
         Workload workload;
+        // Set by create_index_as: the structure to build rather than measure.
+        IndexKind forced = IndexKind::BPlusTree;
+        bool force = false;
         // Mutable so a read path can repair a column it finds stale. A dirty
         // index is never read; ensure_fresh() rebuilds first.
         mutable bool dirty = false;
@@ -493,11 +623,48 @@ private:
             rows.push_back(row);
         }
 
-        ColumnIndex built = catalog_.build_column_typed(name, type, keys, rows,
-                                                        column->workload);
+        // Bitmap columns index every row the table holds, not only the rows
+        // carrying a value, so that two of them can be AND-ed: position i must
+        // mean the same row in both. Rows with no value occupy a position and
+        // appear in no bitmap, which is exactly "absent matches nothing".
+        std::vector<ColumnValue> row_space = store_->keys();
+        std::sort(row_space.begin(), row_space.end());
+
+        ColumnIndex built =
+            column->force
+                ? ColumnIndex::build_typed_with(
+                      type, keys, rows, forced_plan(*column, type, keys, rows),
+                      &row_space)
+                : catalog_.build_column_typed(name, type, keys, rows,
+                                              column->workload, nullptr,
+                                              &row_space);
         column->index = std::make_unique<ColumnIndex>(std::move(built));
         column->dirty = false;
         (void)skipped;  // reported by info_of() from the store, not tracked
+    }
+
+    // The plan create_index_as implies: the named kind, with the encoding its
+    // shape requires.
+    template <typename T>
+    static IndexPlan forced_plan(const Column& column, LogicalType type,
+                                 const std::vector<T>& keys,
+                                 const std::vector<ColumnValue>& rows) {
+        const ColumnShape shape = index::measure_shape(keys, rows);
+        IndexPlan plan;
+        plan.kind = column.forced;
+        plan.type = type;
+        plan.btree_order = 32;
+        plan.rmi_models = 1024;
+        plan.search_threshold = 64;
+        if (column.forced == IndexKind::Bitmap) {
+            plan.encoding = KeyEncoding::Dictionary;
+        } else if (column.forced == IndexKind::BPlusTree) {
+            plan.encoding =
+                shape.unique ? KeyEncoding::Native : KeyEncoding::Composite;
+        } else {
+            plan.encoding = KeyEncoding::Native;
+        }
+        return plan;
     }
 
     void build(const std::string& name, const ColumnDef& def, Column* column) {
@@ -512,6 +679,9 @@ private:
             case LogicalType::String:
                 build_as<std::string>(name, def.type, column);
                 return;
+            case LogicalType::Bool:
+                build_as<bool>(name, def.type, column);
+                return;
             default:
                 break;
         }
@@ -519,13 +689,6 @@ private:
     }
 
     static void reject_unindexable(const ColumnDef& def) {
-        if (def.type == LogicalType::Bool) {
-            throw std::invalid_argument(
-                "Table: column '" + def.name + "' is a bool. Two distinct "
-                "values means an ordered index over it degenerates to a sorted "
-                "list of every row in the table, providing no ordering benefit "
-                "at all; it is served by a bitmap instead, which is phase C.");
-        }
         if (def.type == LogicalType::Vector) {
             throw std::invalid_argument(
                 "Table: column '" + def.name + "' is a vector. Vector columns "
@@ -582,16 +745,15 @@ private:
         }
 
         const Datum value = schema_.parse(name, text);
-        const bool inserted = column.index->insert_row(value, key);
+        const bool representable = column.index->insert_row(value, key);
         ++result->indexes_touched;
 
-        // A natively-keyed column was chosen because its values were unique.
-        // An insert that collides has just made them non-unique, and the tree
-        // overwrote the colliding row's entry rather than storing both — so
-        // the index is wrong until it is rebuilt with a composite key.
-        if (!inserted && column.index->is_native()) {
-            mark_dirty(column, result);
-        }
+        // False means the structure cannot represent the result, whatever the
+        // structure is: a natively-keyed column has just been made non-unique,
+        // or a bitmap has been handed a row that would shift every position
+        // after it. Either way the repair is the same and the call site does
+        // not need to know which happened.
+        if (!representable) mark_dirty(column, result);
     }
 
     void remove_entry(const std::string& name, Column& column,
@@ -736,6 +898,120 @@ private:
                 break;
         }
         return false;
+    }
+
+    // ---- conjunction strategies --------------------------------------------
+
+    // Word-parallel AND, when every predicate is served by a bitmap column and
+    // those columns index the same rows in the same order.
+    //
+    // The row-space check is not defensive padding: two bitmaps whose
+    // positions mean different rows would produce an answer that looks
+    // plausible and matches neither predicate. Bitmap columns are built over a
+    // table's entire row set so that they *do* line up, and this confirms it
+    // rather than assuming it.
+    bool bitmap_conjunction(const std::vector<Predicate>& predicates,
+                            std::vector<std::int64_t>* out,
+                            QueryTrace* trace) const {
+        const ColumnIndex* first = nullptr;
+        std::size_t space = 0;
+        for (const Predicate& p : predicates) {
+            if (!op_is_indexable(p.op) || p.op == PredOp::Between ||
+                p.op == PredOp::Prefix) {
+                return false;
+            }
+            const auto it = columns_.find(p.column);
+            if (it == columns_.end() || !it->second.index) return false;
+            ensure_fresh(p.column);
+            const ColumnIndex& index = *it->second.index;
+            if (!index.has_bitmap()) return false;
+            if (first == nullptr) {
+                first = &index;
+                space = index.row_space();
+            } else if (index.row_space() != space) {
+                return false;
+            }
+        }
+        if (first == nullptr) return false;
+
+        index::Bitset mask;
+        bool started = false;
+        for (const Predicate& p : predicates) {
+            const ColumnIndex& index = *columns_.at(p.column).index;
+            index::Bitset one = index.bitmap_for(compare_op_of(p.op), p.value);
+            if (!started) {
+                mask = std::move(one);
+                started = true;
+            } else {
+                mask &= one;
+            }
+        }
+        *out = first->decode(mask);
+        trace->used_index = true;
+        trace->reason = "bitmap AND over " + std::to_string(predicates.size()) +
+                        " columns, " + std::to_string((space + 63) / 64) +
+                        " words";
+        return true;
+    }
+
+    // Execute the most selective predicate first, then intersect.
+    //
+    // Selectivity is known for free on a bitmap column (a popcount) and costs
+    // a full execution on any other, so the ordering pass asks each column for
+    // a count and only the cheap answers are actually cheap. That asymmetry is
+    // itself a reason the bitmap earns its place.
+    std::vector<std::int64_t> merge_conjunction(
+        const std::vector<Predicate>& predicates, QueryTrace* trace) const {
+        std::vector<const Predicate*> order;
+        order.reserve(predicates.size());
+        for (const Predicate& p : predicates) order.push_back(&p);
+
+        std::stable_sort(order.begin(), order.end(),
+                         [this](const Predicate* a, const Predicate* b) {
+                             return estimate(*a) < estimate(*b);
+                         });
+
+        std::vector<std::int64_t> out;
+        bool started = false;
+        for (const Predicate* p : order) {
+            QueryTrace one;
+            const std::vector<std::int64_t> keys = select_keys(*p, &one);
+            trace->scanned += one.scanned;
+            trace->used_index = trace->used_index || one.used_index;
+            if (!started) {
+                out = keys;
+                started = true;
+            } else {
+                std::vector<std::int64_t> merged;
+                merged.reserve(std::min(out.size(), keys.size()));
+                std::set_intersection(out.begin(), out.end(), keys.begin(),
+                                      keys.end(), std::back_inserter(merged));
+                out = std::move(merged);
+            }
+            if (out.empty()) break;  // nothing can rejoin an empty set
+        }
+        trace->reason = "sorted merge over " + std::to_string(predicates.size()) +
+                        " predicates, most selective first";
+        return out;
+    }
+
+    // How many rows a predicate is expected to match, for ordering only.
+    //
+    // Exact and nearly free on a bitmap column; on any other this is the whole
+    // query, so the estimate is the row count instead — deliberately useless,
+    // because paying to order the work would cost more than the ordering saves.
+    std::size_t estimate(const Predicate& p) const {
+        if (!op_is_indexable(p.op) || p.op == PredOp::Between ||
+            p.op == PredOp::Prefix) {
+            return store_->size();
+        }
+        const auto it = columns_.find(p.column);
+        if (it == columns_.end() || !it->second.index ||
+            !it->second.index->has_bitmap()) {
+            return store_->size();
+        }
+        ensure_fresh(p.column);
+        return columns_.at(p.column).index->count(compare_op_of(p.op), p.value);
     }
 
     // ---- validation helpers ------------------------------------------------

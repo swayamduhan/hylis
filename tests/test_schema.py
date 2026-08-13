@@ -19,6 +19,7 @@ from hylis import (
     ColumnIndex,
     CompareOp,
     IndexKind,
+    IndexPlan,
     KeyEncoding,
     LogicalType,
     Record,
@@ -36,6 +37,21 @@ BRANDS = ["adidas", "nib", "nike", "nikelab", "nikon", "puma", "zara"]
 
 def rows(n):
     return list(range(n))
+
+
+def composite_column(type_, keys, row_ids):
+    """Build with the composite encoding, whatever choose_index would pick.
+
+    These tests are about the composite structure, and a low-cardinality column
+    is now also a bitmap candidate -- so letting the selector decide would make
+    them pass or fail on which candidate won a timing race that day.
+    """
+    plan = IndexPlan()
+    plan.kind = IndexKind.BPlusTree
+    plan.type = type_
+    plan.encoding = KeyEncoding.Composite
+    plan.btree_order = 32
+    return ColumnIndex.build_typed_with(type_, keys, row_ids, plan)
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +311,7 @@ def test_a_wrong_typed_predicate_raises_rather_than_answering():
 
 def test_duplicated_values_get_the_composite_encoding():
     values = ["bags"] * 4 + ["hats"] * 4 + ["shoes"] * 4
-    c = ColumnIndex.build_typed(LogicalType.String, values, rows(12))
+    c = composite_column(LogicalType.String, values, rows(12))
 
     assert c.encoding == KeyEncoding.Composite
     assert not c.is_native
@@ -313,7 +329,7 @@ def test_duplicated_values_get_the_composite_encoding():
 
 def test_find_returns_none_on_a_composite_column_rather_than_guessing():
     values = [10, 10, 10, 20]
-    c = ColumnIndex.build_typed(LogicalType.Int64, values, rows(4))
+    c = composite_column(LogicalType.Int64, values, rows(4))
     assert c.encoding == KeyEncoding.Composite
     # Three rows hold 10. Returning one of them would be a coin toss, so the
     # caller is steered to lookup() by a None.
@@ -322,9 +338,9 @@ def test_find_returns_none_on_a_composite_column_rather_than_guessing():
 
 
 def test_composite_erase_needs_the_row_id():
-    c = ColumnIndex.build_typed(LogicalType.String, ["a", "a", "b"], rows(3))
+    c = composite_column(LogicalType.String, ["a", "a", "b"], rows(3))
     # The value alone names two rows, so the value-only overload refuses.
-    numeric = ColumnIndex.build_typed(LogicalType.Int64, [1, 1, 2], rows(3))
+    numeric = composite_column(LogicalType.Int64, [1, 1, 2], rows(3))
     assert not numeric.is_native
     with pytest.raises(ValueError):
         numeric.erase(1)
@@ -349,7 +365,7 @@ def test_every_operator_agrees_with_a_python_oracle():
     keys = [k for k, _ in pairs]
     values = [v for _, v in pairs]
 
-    c = ColumnIndex.build_typed(LogicalType.Int64, keys, values)
+    c = composite_column(LogicalType.Int64, keys, values)
     assert c.encoding == KeyEncoding.Composite
 
     checks = {
@@ -383,11 +399,14 @@ def test_a_timestamp_column_is_detected_as_monotone():
     assert c.find(stamps[100]) == 100
 
 
-def test_a_bool_column_is_refused_with_the_reason():
-    # Two distinct values means an ordered index degenerates to a sorted list
-    # of every row in the table. It gets a bitmap instead, in a later phase.
-    with pytest.raises(ValueError, match="bitmap"):
-        ColumnIndex.build_typed(LogicalType.Bool, [False, True], rows(2))
+def test_a_bool_column_is_only_ever_offered_a_bitmap():
+    # Two distinct values means an ordered index over it is a sorted list of
+    # every row in the table providing no ordering benefit whatever.
+    shape = measure_shape([0, 0, 1, 1], rows(4))
+    plans = candidates_for(LogicalType.Bool, shape)
+    assert len(plans) == 1
+    assert plans[0].kind == IndexKind.Bitmap
+    assert plans[0].encoding == KeyEncoding.Dictionary
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +418,10 @@ def test_a_string_column_is_never_offered_a_learned_index():
     shape = measure_shape(list(range(1000)), list(range(1000)))
     plans = candidates_for(LogicalType.String, shape)
     assert plans
-    assert all(p.kind == IndexKind.BPlusTree for p in plans)
+    # The claim is about the learned index, not about the tree being alone: a
+    # low-cardinality string column is also a bitmap candidate.
+    assert all(p.kind not in (IndexKind.RMI, IndexKind.DynamicRMI) for p in plans)
+    assert any(p.kind == IndexKind.BPlusTree for p in plans)
 
 
 def test_a_unique_numeric_column_is_offered_one():
@@ -415,9 +437,15 @@ def test_duplicates_disqualify_the_learned_index():
     shape = measure_shape(keys, list(range(1000)))
     assert not shape.unique
     plans = candidates_for(LogicalType.Int64, shape)
-    assert len(plans) == 1
-    assert plans[0].kind == IndexKind.BPlusTree
-    assert plans[0].encoding == KeyEncoding.Composite
+    assert plans
+    for p in plans:
+        assert p.kind not in (IndexKind.RMI, IndexKind.DynamicRMI)
+        # Nor a native key, which maps one value to one row.
+        assert p.encoding != KeyEncoding.Native
+    # 40 distinct values is few enough that the bitmap is offered alongside the
+    # composite tree; which of the two wins is measured, not asserted.
+    assert any(p.kind == IndexKind.BPlusTree for p in plans)
+    assert any(p.kind == IndexKind.Bitmap for p in plans)
 
 
 def test_a_writable_column_is_still_never_offered_the_static_rmi():

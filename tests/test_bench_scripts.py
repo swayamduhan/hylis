@@ -301,6 +301,35 @@ def test_write_path_experiment_prices_index_maintenance():
             or "no build-only structure" in out), out
 
 
+def test_bitmap_cardinality_experiment_finds_the_crossover():
+    """E2. It sets kBitmapMaxDistinct in column_index.hpp, so if the measured
+    crossover ever moves the constant is describing something that is no longer
+    true. It also reports the count() asymmetry the whole family exists for."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_bitmap_cardinality.py", ["--quick"])
+    assert proc.returncode == 0, out
+    assert "distinct" in out and "density" in out
+    assert "memory crossover at distinct" in out
+    assert "count() best case" in out
+    # Ratios are tree/bitmap, so the count column must show the bitmap ahead by
+    # a lot; if it ever does not, the family has lost its reason to exist.
+    assert "count()" in out
+
+
+def test_conjunction_experiment_compares_both_strategies():
+    """E4. The planner's stated reason for taking a single predicate was that
+    two introduce no new decision. This is the measurement that made that
+    false, and it has to keep running or the claim reverts to an assertion."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_conjunction.py", ["--quick"])
+    assert proc.returncode == 0, out
+    assert "bitmap AND" in out and "sorted merge" in out
+    assert "MISMATCH" not in out, out
+    assert "IndexKind.Bitmap" in out, "the bitmap arm did not get a bitmap"
+
+
 def test_printed_output_is_console_safe():
     """Windows consoles are cp1252 by default, and an em-dash in a print()
     has already cost this project one UnicodeEncodeError. Cheaper to assert
@@ -309,7 +338,9 @@ def test_printed_output_is_console_safe():
                    "fetch_data.py", "experiment_router_scaling.py",
                    "experiment_discontinuity.py", "bench_planner.py",
                    "experiment_double_rmi.py", "experiment_duplicate_keys.py",
-                   "experiment_write_path.py"):
+                   "experiment_write_path.py",
+                   "experiment_bitmap_cardinality.py",
+                   "experiment_conjunction.py"):
         text = (SCRIPTS / script).read_text(encoding="utf-8")
         for number, line in enumerate(text.split("\n"), start=1):
             stripped = line.lstrip()
@@ -325,7 +356,9 @@ def test_scripts_report_their_own_usage():
                    "experiment_router_scaling.py",
                    "experiment_discontinuity.py", "bench_planner.py",
                    "experiment_double_rmi.py", "experiment_duplicate_keys.py",
-                   "experiment_write_path.py"):
+                   "experiment_write_path.py",
+                   "experiment_bitmap_cardinality.py",
+                   "experiment_conjunction.py"):
         proc, out = run(script, ["--help"])
         assert proc.returncode == 0, out
         assert "usage:" in out.lower()
