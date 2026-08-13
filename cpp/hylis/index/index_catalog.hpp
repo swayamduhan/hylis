@@ -273,6 +273,94 @@ public:
         return index;
     }
 
+    // Freshness for a column whose keys are not int64.
+    //
+    // The int64 path fingerprints on length plus both endpoints. A string or
+    // double column has no endpoints this struct can hold, so it fingerprints
+    // on length plus the distinct count instead — weaker, and weaker in a way
+    // that costs nothing: a false positive only means a column keeps a
+    // now-suboptimal structure, because every model and every error bound is
+    // recomputed at build time whichever plan was followed.
+    Freshness freshness_typed(const std::string& column, std::size_t n_keys,
+                              std::size_t distinct) const {
+        const auto it = plans_.find(column);
+        if (it == plans_.end()) return Freshness::Missing;
+        const bool same = it->second.n_keys == n_keys &&
+                          it->second.distinct == distinct;
+        return same ? Freshness::Fresh : Freshness::Stale;
+    }
+
+    // build_column for a typed column. Same three-way decision — replay,
+    // re-time then decide, or re-choose — over a key type the int64 version
+    // cannot express.
+    template <typename T>
+    ColumnIndex build_column_typed(const std::string& column, LogicalType type,
+                                   const std::vector<T>& keys,
+                                   const std::vector<ColumnValue>& values,
+                                   Workload workload = Workload{},
+                                   Decision* decision = nullptr) {
+        Decision out;
+        const ColumnShape shape = measure_shape(keys, values);
+        out.freshness = freshness_typed(column, keys.size(), shape.distinct);
+        const std::optional<IndexPlan> stored = get(column);
+
+        // A plan for a different type is not a plan for this column at all —
+        // it describes a structure that cannot hold these keys.
+        //
+        // Nor is a plan that assumed uniqueness the data no longer has. Both
+        // a learned index and a natively-keyed tree map one key to one row:
+        // RMIndex::build throws outright on a repeated key, and BPlusTree
+        // silently overwrites, which is worse. Only the composite tree can
+        // hold a duplicated column, so when uniqueness is gone every other
+        // stored plan stops being a legal answer however well it once fitted.
+        //
+        // Found by a test that made a unique column non-unique with one
+        // insert and then watched the catalog replay the old plan onto it.
+        const bool shape_fits =
+            shape.unique || (stored.has_value() &&
+                             stored->kind == IndexKind::BPlusTree &&
+                             stored->encoding == KeyEncoding::Composite);
+        const bool usable = stored.has_value() && stored->type == type &&
+                            stored->serves(workload) && shape_fits &&
+                            stored->write_fraction == workload.write_fraction;
+
+        if (usable && out.freshness == Freshness::Fresh) {
+            out.action = Action::Replayed;
+            ColumnIndex index =
+                ColumnIndex::build_typed_with(type, keys, values, *stored);
+            set(column, index.plan());
+            if (decision) *decision = out;
+            return index;
+        }
+
+        if (usable && out.freshness == Freshness::Stale) {
+            // Stale, but maybe only technically. Measure before spending.
+            const IndexPlan replayed =
+                measure_plan_for(type, keys, values, *stored, workload);
+            out.recorded_ns = stored->ns_per_lookup;
+            out.measured_ns = replayed.ns_per_lookup;
+
+            const bool still_good =
+                stored->ns_per_lookup > 0.0 &&
+                replayed.ns_per_lookup <= stored->ns_per_lookup * retune_factor_;
+            if (still_good) {
+                out.action = Action::Replayed;
+                ColumnIndex index =
+                    ColumnIndex::build_typed_with(type, keys, values, *stored);
+                set(column, index.plan());
+                if (decision) *decision = out;
+                return index;
+            }
+            out.action = Action::Retuned;
+        }
+
+        ColumnIndex index = ColumnIndex::build_typed(
+            type, keys, values, std::numeric_limits<std::size_t>::max(), workload);
+        set(column, index.plan());
+        if (decision) *decision = out;
+        return index;
+    }
+
     std::string serialize() const {
         std::string out = "{\"version\":1,\"plans\":[";
         bool first = true;

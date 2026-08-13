@@ -45,6 +45,14 @@ from hylis.schema import (  # noqa: F401
     type_supports_rmi,
 )
 from hylis.storage import Record, RecordStore  # noqa: F401
+from hylis.table import (  # noqa: F401
+    ColumnInfo,
+    PredOp,
+    QueryTrace,
+    Table,
+    WriteResult,
+    op_is_indexable,
+)
 from hylis.vector import (  # noqa: F401
     FlatIndex,
     HnswIndex,

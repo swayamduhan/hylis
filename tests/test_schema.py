@@ -323,10 +323,21 @@ def test_find_returns_none_on_a_composite_column_rather_than_guessing():
 
 def test_composite_erase_needs_the_row_id():
     c = ColumnIndex.build_typed(LogicalType.String, ["a", "a", "b"], rows(3))
+    # The value alone names two rows, so the value-only overload refuses.
+    numeric = ColumnIndex.build_typed(LogicalType.Int64, [1, 1, 2], rows(3))
+    assert not numeric.is_native
     with pytest.raises(ValueError):
-        c.erase_row("a", 0)
+        numeric.erase(1)
+
+    # erase_row names the row, and only that row goes. Row 0 is an ordinary
+    # row id here, not a stand-in for "unspecified" -- an earlier version used
+    # it as a sentinel and threw on the one row it should have removed.
+    assert c.erase_row("a", 0)
+    assert c.lookup("a") == [1]
     assert c.erase_row("a", 1)
-    assert c.lookup("a") == [0]
+    assert c.lookup("a") == []
+    # A row that does not hold this value is not removed, and says so.
+    assert not c.erase_row("b", 99)
     c.validate()
 
 

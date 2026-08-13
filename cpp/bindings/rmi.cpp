@@ -548,6 +548,12 @@ PYBIND11_MODULE(_rmi, m) {
              "Exact, byte-order, and a single leaf-chain walk. Impossible under\n"
              "any integer encoding of the string, which is the clearest reason\n"
              "to index strings as strings.")
+        .def("insert", &ColumnIndex::insert, py::arg("key"), py::arg("value"),
+             "Insert by int64 key. The pre-typed API, kept working.")
+        .def("erase", &ColumnIndex::erase, py::arg("key"),
+             "Erase by value alone. Legal only where one value names one row;\n"
+             "a composite column raises, because picking one of several rows\n"
+             "would delete one the caller never named.")
         .def("insert_row", [](ColumnIndex& self, py::handle value, std::int64_t row) {
             return self.insert_row(datum_from_py(value), row);
         }, py::arg("value"), py::arg("row"))

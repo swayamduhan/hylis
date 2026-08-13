@@ -753,22 +753,29 @@ public:
     bool insert(const ColumnKey& key, const ColumnValue& value) {
         return index_->insert(Datum{key}, value);
     }
+    // Erase by value alone. Legal only where one value names one row.
+    //
+    // A composite key is (value, row), so without the row there is no key to
+    // erase and picking one arbitrarily would delete a row the caller never
+    // named. The check lives here rather than in erase_row() because there is
+    // no row id that can stand for "unspecified" — row 0 is a perfectly
+    // ordinary record key, and using it as a sentinel made erase_row(v, 0)
+    // throw on the one row it should have removed.
     bool erase(const ColumnKey& key) {
-        return erase_row(Datum{key}, 0);
+        if (!index_->is_native()) {
+            throw std::invalid_argument(
+                "ColumnIndex::erase: this column repeats values, so a value "
+                "alone does not identify a row. Use erase_row(value, row).");
+        }
+        return index_->erase(Datum{key}, 0);
     }
 
     bool insert_row(const Datum& value, const ColumnValue& row) {
         return index_->insert(value, row);
     }
+    // Erase one row's entry. The row id is ignored by a native encoding, where
+    // the value alone is the key, and is half the key under a composite one.
     bool erase_row(const Datum& value, const ColumnValue& row) {
-        if (!index_->is_native() && row == 0) {
-            // A composite key is (value, row): without the row there is no key
-            // to erase, and picking one arbitrarily would delete a row the
-            // caller did not name.
-            throw std::invalid_argument(
-                "ColumnIndex::erase: this column repeats values, so a value "
-                "alone does not identify a row. Pass the row id.");
-        }
         return index_->erase(value, row);
     }
 

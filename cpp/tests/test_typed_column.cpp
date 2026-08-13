@@ -208,9 +208,22 @@ TEST(CompositeEncoding, ErasingNeedsTheRowIdBecauseTheKeyContainsIt) {
     std::vector<std::string> values = {"a", "a", "b"};
     ColumnIndex c = ColumnIndex::build_typed(LogicalType::String, values, identity(3));
 
-    EXPECT_THROW(c.erase_row(Datum{std::string("a")}, 0), std::invalid_argument);
+    // The value alone names two rows, so the value-only overload refuses.
+    ColumnIndex byvalue =
+        ColumnIndex::build_typed(LogicalType::Int64, std::vector<ColumnKey>{1, 1, 2},
+                                 identity(3));
+    ASSERT_FALSE(byvalue.is_native());
+    EXPECT_THROW(byvalue.erase(1), std::invalid_argument);
+
+    // erase_row names the row, and only that row goes. Row 0 is an ordinary
+    // row id here, not a stand-in for "unspecified" — an earlier version used
+    // it as a sentinel and threw on the one row it should have removed.
+    EXPECT_TRUE(c.erase_row(Datum{std::string("a")}, 0));
+    EXPECT_EQ(c.lookup(Datum{std::string("a")}), std::vector<ColumnValue>{1});
     EXPECT_TRUE(c.erase_row(Datum{std::string("a")}, 1));
-    EXPECT_EQ(c.lookup(Datum{std::string("a")}), std::vector<ColumnValue>{0});
+    EXPECT_TRUE(c.lookup(Datum{std::string("a")}).empty());
+    // A row that does not hold this value is not removed, and says so.
+    EXPECT_FALSE(c.erase_row(Datum{std::string("b")}, 99));
     EXPECT_NO_THROW(c.validate());
 }
 

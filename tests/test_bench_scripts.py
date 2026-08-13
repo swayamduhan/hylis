@@ -281,6 +281,26 @@ def test_duplicate_key_experiment_compares_equal_work():
     assert "Nothing about the data was learned" in out
 
 
+def test_write_path_experiment_prices_index_maintenance():
+    """E6. Its three findings are each a claim made elsewhere in the codebase:
+    that index maintenance is negligible against the fsync, that a wrong
+    workload declaration costs bounded rebuilds, and that put_batch turns n
+    rebuilds into one. That last one is asserted in table.hpp's docstring, and
+    a benchmark that stopped checking it would let the docstring drift."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_write_path.py", ["--quick"])
+    assert proc.returncode == 0, out
+    assert "store floor" in out
+    assert "share of a write" in out
+    assert "rebuilds" in out
+    assert "put_batch" in out
+    # The batch claim either holds or the docstring is wrong; the script says
+    # which, and it must not quietly stop saying anything.
+    assert ("The claim holds" in out or "does NOT hold" in out
+            or "no build-only structure" in out), out
+
+
 def test_printed_output_is_console_safe():
     """Windows consoles are cp1252 by default, and an em-dash in a print()
     has already cost this project one UnicodeEncodeError. Cheaper to assert
@@ -288,7 +308,8 @@ def test_printed_output_is_console_safe():
     for script in ("bench_sosd.py", "experiment_merge_threshold.py",
                    "fetch_data.py", "experiment_router_scaling.py",
                    "experiment_discontinuity.py", "bench_planner.py",
-                   "experiment_double_rmi.py", "experiment_duplicate_keys.py"):
+                   "experiment_double_rmi.py", "experiment_duplicate_keys.py",
+                   "experiment_write_path.py"):
         text = (SCRIPTS / script).read_text(encoding="utf-8")
         for number, line in enumerate(text.split("\n"), start=1):
             stripped = line.lstrip()
@@ -303,7 +324,8 @@ def test_scripts_report_their_own_usage():
                    "experiment_merge_threshold.py", "bench_sosd.py",
                    "experiment_router_scaling.py",
                    "experiment_discontinuity.py", "bench_planner.py",
-                   "experiment_double_rmi.py", "experiment_duplicate_keys.py"):
+                   "experiment_double_rmi.py", "experiment_duplicate_keys.py",
+                   "experiment_write_path.py"):
         proc, out = run(script, ["--help"])
         assert proc.returncode == 0, out
         assert "usage:" in out.lower()

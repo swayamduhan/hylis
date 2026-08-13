@@ -23,7 +23,7 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 | 6 | Neural Router       | ✅ |
 | 7 | Incremental retrain | ✅ |
 | 8 | Query planner       | ✅ |
-| 9 | Typed columns       | ◐ phase A of 5 |
+| 9 | Typed columns       | ◐ phases A–B of 5 |
 | 10| Benchmarks          | ☐ |
 | 11| Demo CLI            | ☐ |
 
@@ -40,16 +40,15 @@ That was module 8, and it is now built. The rest, ranked by value:
 
 **1. ~~The hybrid query planner (module 8).~~** ✅ Done — see below.
 
-**2. Wire `RecordStore` to `ColumnIndex`.** Module 1 is complete, tested, and
-connected to nothing — no index reads from the store it built. Starting this
-turned up a problem *underneath* the wiring: `ColumnIndex` was hard-wired to
-`int64 → int64`, which is fine for a synthetic key array and wrong for a table
-with prices, categories, titles, flags and timestamps. **Phase A of the typed
-column layer is now built** (see below). What remains: the `Table` join
-itself, a bitmap family for `Bool` and low-cardinality columns, typed
-predicates through the planner, and vectors declared in the schema but stored
-outside the record — a 128-float embedding is ~700 bytes of base64 per row and
-would make the write-ahead log the dominant cost of the system.
+**2. ~~Wire `RecordStore` to `ColumnIndex`.~~** ✅ Done — see *Tables* below.
+Starting it turned up a problem *underneath* the wiring: `ColumnIndex` was
+hard-wired to `int64 → int64`, which is fine for a synthetic key array and
+wrong for a table with prices, categories, titles, flags and timestamps. So the
+typed column layer came first, and the join followed. What remains of it: a
+bitmap family for `Bool` and low-cardinality columns, typed predicates through
+the planner, and vectors declared in the schema but stored outside the record —
+a 128-float embedding is ~700 bytes of base64 per row and would make the
+write-ahead log the dominant cost of the system.
 
 **3. Vector deletion.** Module 7 made the structured side fully mutable, but
 `HnswIndex` and `FlatIndex` stay append-only, so `DynamicRMIndex::erase` has no
@@ -112,6 +111,53 @@ hands the model `0, 1, 2, … m-1`, which one linear model fits with **zero
 error** — nothing about the data is learned, and calling the result a learned
 index would misdescribe it.
 
+## Tables
+
+The join that had been missing. `RecordStore` was complete, durable and tested,
+and no index had ever read from it — every index was built from vectors that
+came from a test fixture. `Table` is the path from a stored record to an index
+over it, and to a `SELECT ... WHERE` that returns rows.
+
+```python
+store  = RecordStore("data/shop")
+schema = Schema([ColumnDef("price",    LogicalType.Int64),
+                 ColumnDef("category", LogicalType.String),
+                 ColumnDef("title",    LogicalType.String)])
+table = Table(store, schema)
+
+table.put_batch(rows)
+table.create_index("category", write_fraction=0.1)
+
+rows, trace = table.select("title", PredOp.Prefix, "nike")
+print(trace.reason)   # index on 'title' (btree, composite) answered it
+```
+
+The record's primary key **is** the row id, so secondary indexes map
+`value → record key` and a predicate's answer is directly a set of keys the
+store can fetch. Nothing is renumbered, which is what makes writes exact
+rather than approximate.
+
+Every query returns a trace saying whether an index answered it. Two operators
+no ordered index can serve — `Contains` (infix) and `IsNull` — are answered
+anyway, by scanning, and the trace says so. Refusing them and silently scanning
+are both worse.
+
+```bash
+python scripts/experiment_write_path.py    # E6: what an index costs to keep
+```
+
+**E6.** Index maintenance is a rounding error against durability: three indexed
+columns cost **823 ns per write** against a **302 µs** store floor — 0.27%.
+That floor is the WAL's fsync-per-write, so on this storage layer the honest
+advice is to index freely, and the throughput ceiling belongs to the storage
+layer rather than the index layer.
+
+Declaring a column read-only and then writing to it is the only remaining path
+to a rebuild, and it **self-corrects**: the first write that breaks uniqueness
+makes the stored plan illegal for the data, so the column is re-chosen onto a
+mutable structure and never rebuilds again. `put_batch` turns those n rebuilds
+into one — measured at 40 versus 1.
+
 ### The framing these add up to
 
 Three levels of a database, each with a learned component measured against the
@@ -140,9 +186,9 @@ cpp/
     storage/    # record store + write-ahead log (header-only)
     index/      # B+ tree, RMI, logical types, per-column selection,
                 #   flat + HNSW vector search
-    query/      # schema, hybrid query planner
+    query/      # schema, predicates, table, hybrid query planner
   bindings/     # pybind11 -> hylis._storage, _btree, _flat, _rmi, _hnsw,
-                #   _planner, _schema
+                #   _planner, _schema, _table
   tests/        # GoogleTest suites for the C++ core
 python/hylis/   # user-facing Python API; built extensions land here
   datasets.py   # data generators + loaders + the brute-force oracle
