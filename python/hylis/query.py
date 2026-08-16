@@ -25,9 +25,14 @@ between *answers*.
 from hylis._planner import (  # noqa: F401
     HybridPlanner,
     PlanKind,
-    Predicate,
     QueryPlan,
 )
+
+# Predicate lives in hylis._table: query/predicate.hpp is the query layer's
+# shared type. The planner and the table used to define one each, which meant
+# they could never appear in the same program -- and a demo of the whole system
+# has to do exactly that.
+from hylis._table import PredOp, Predicate  # noqa: F401
 
 
 import numpy as np

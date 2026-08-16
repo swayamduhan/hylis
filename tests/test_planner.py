@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from hylis import (
-    CompareOp,
+    PredOp,
     FlatIndex,
     HnswIndex,
     HybridPlanner,
@@ -70,7 +70,7 @@ def test_answers_a_query_neither_index_could_answer_alone(built, corpus):
     cut = price.key_cut_for_selectivity(0.10)
 
     found, plan = planner.search(
-        Predicate("price", CompareOp.Lt, cut), corpus.vectors.queries[0], k=10, ef=200
+        Predicate("price", PredOp.Lt, cut), corpus.vectors.queries[0], k=10, ef=200
     )
     assert len(found) == 10
     assert plan.matched_rows == cut
@@ -87,7 +87,7 @@ def test_the_structured_half_works_on_its_own(built):
     planner = make_planner(built)
     _, _, price = built
     cut = price.key_cut_for_selectivity(0.25)
-    rows = planner.matching_rows(Predicate("price", CompareOp.Lt, cut))
+    rows = planner.matching_rows(Predicate("price", PredOp.Lt, cut))
     assert len(rows) == cut
     assert sorted(rows) == sorted(price.rows_below(cut).tolist())
 
@@ -96,7 +96,7 @@ def test_the_planner_explains_itself(built):
     planner = make_planner(built)
     _, _, price = built
     plan = planner.explain(
-        Predicate("price", CompareOp.Lt, price.key_cut_for_selectivity(0.05)), k=10
+        Predicate("price", PredOp.Lt, price.key_cut_for_selectivity(0.05)), k=10
     )
     assert plan.reason, "a planner that cannot say why is not defensible"
     assert "crossover" in plan.reason
@@ -111,7 +111,7 @@ def test_every_plan_returns_the_same_rows(built, corpus, selectivity):
     planner = make_planner(built)
     _, _, price = built
     cut = price.key_cut_for_selectivity(selectivity)
-    predicate = Predicate("price", CompareOp.Lt, cut)
+    predicate = Predicate("price", PredOp.Lt, cut)
     query = corpus.vectors.queries[0]
     k = 10
 
@@ -136,7 +136,7 @@ def test_post_filter_is_a_prefix_of_the_truth(built, corpus, selectivity):
     cut = price.key_cut_for_selectivity(selectivity)
     post = planner.search_with(
         PlanKind.PostFilter,
-        Predicate("price", CompareOp.Lt, cut),
+        Predicate("price", PredOp.Lt, cut),
         corpus.vectors.queries[0],
         k=10,
         ef=400,
@@ -156,7 +156,7 @@ def test_post_filter_can_silently_return_fewer_than_k(built, corpus):
     # just mean "there were not 10 rows", which is a correct answer rather than
     # the failure being demonstrated.
     cut = price.key_cut_for_selectivity(0.01)  # 40 rows, k = 10
-    predicate = Predicate("price", CompareOp.Lt, cut)
+    predicate = Predicate("price", PredOp.Lt, cut)
     assert planner.explain(predicate, 10).matched_rows > 10
 
     post = planner.search_with(
@@ -173,7 +173,7 @@ def test_post_filter_can_silently_return_fewer_than_k(built, corpus):
 
 
 @pytest.mark.parametrize(
-    "op", [CompareOp.Lt, CompareOp.Le, CompareOp.Gt, CompareOp.Ge, CompareOp.Eq]
+    "op", [PredOp.Lt, PredOp.Le, PredOp.Gt, PredOp.Ge, PredOp.Eq]
 )
 def test_every_predicate_agrees_with_a_numpy_oracle(built, corpus, op):
     planner = make_planner(built)
@@ -182,11 +182,11 @@ def test_every_predicate_agrees_with_a_numpy_oracle(built, corpus, op):
     keys = price.keys  # key == sorted position
 
     wanted = {
-        CompareOp.Lt: keys < cut,
-        CompareOp.Le: keys <= cut,
-        CompareOp.Gt: keys > cut,
-        CompareOp.Ge: keys >= cut,
-        CompareOp.Eq: keys == cut,
+        PredOp.Lt: keys < cut,
+        PredOp.Le: keys <= cut,
+        PredOp.Gt: keys > cut,
+        PredOp.Ge: keys >= cut,
+        PredOp.Eq: keys == cut,
     }[op]
     allowed = price.values[wanted].tolist()
 
@@ -206,14 +206,14 @@ def test_tight_predicates_pre_filter_and_loose_ones_do_not(built):
     tight = price.key_cut_for_selectivity(0.01)
     loose = price.key_cut_for_selectivity(0.95)
 
-    assert planner.explain(Predicate("price", CompareOp.Lt, tight), 10).kind == PlanKind.PreFilter
-    assert planner.explain(Predicate("price", CompareOp.Lt, loose), 10).kind == PlanKind.FilteredGraph
+    assert planner.explain(Predicate("price", PredOp.Lt, tight), 10).kind == PlanKind.PreFilter
+    assert planner.explain(Predicate("price", PredOp.Lt, loose), 10).kind == PlanKind.FilteredGraph
 
 
 def test_the_threshold_is_what_moves(built):
     _, _, price = built
     cut = price.key_cut_for_selectivity(0.30)
-    predicate = Predicate("price", CompareOp.Lt, cut)
+    predicate = Predicate("price", PredOp.Lt, cut)
     assert make_planner(built, 0.5).explain(predicate, 10).kind == PlanKind.PreFilter
     assert make_planner(built, 0.1).explain(predicate, 10).kind == PlanKind.FilteredGraph
 
@@ -227,7 +227,7 @@ def test_the_threshold_is_settable_after_construction(built):
 
 def test_fewer_matches_than_k_is_always_a_scan(built):
     planner = make_planner(built, threshold=0.0)  # would otherwise force the graph
-    plan = planner.explain(Predicate("price", CompareOp.Lt, 5), k=10)
+    plan = planner.explain(Predicate("price", PredOp.Lt, 5), k=10)
     assert plan.kind == PlanKind.PreFilter
     assert "do not exceed k" in plan.reason
 
@@ -238,7 +238,7 @@ def test_fewer_matches_than_k_is_always_a_scan(built):
 def test_a_predicate_matching_nothing_skips_the_vector_work(built, corpus):
     planner = make_planner(built)
     found, plan = planner.search(
-        Predicate("price", CompareOp.Lt, 0), corpus.vectors.queries[0], k=10
+        Predicate("price", PredOp.Lt, 0), corpus.vectors.queries[0], k=10
     )
     assert found == []
     assert plan.matched_rows == 0
@@ -248,7 +248,7 @@ def test_a_predicate_matching_nothing_skips_the_vector_work(built, corpus):
 def test_k_larger_than_the_match_count_returns_every_match(built, corpus):
     planner = make_planner(built)
     found, _ = planner.search(
-        Predicate("price", CompareOp.Lt, 7), corpus.vectors.queries[0], k=50
+        Predicate("price", PredOp.Lt, 7), corpus.vectors.queries[0], k=50
     )
     assert len(found) == 7
 
@@ -258,14 +258,14 @@ def test_an_unknown_column_says_which_ones_exist(built):
     assert planner.has_column("price")
     assert not planner.has_column("nosuch")
     with pytest.raises(ValueError, match="price"):
-        planner.matching_rows(Predicate("nosuch", CompareOp.Lt, 10))
+        planner.matching_rows(Predicate("nosuch", PredOp.Lt, 10))
 
 
 def test_a_wrong_shaped_query_is_reported(built, corpus):
     planner = make_planner(built)
     with pytest.raises(ValueError, match="1-D"):
         planner.search(
-            Predicate("price", CompareOp.Lt, 100),
+            Predicate("price", PredOp.Lt, 100),
             np.zeros((2, 16), dtype=np.float32),
             k=5,
         )
@@ -283,7 +283,7 @@ def test_the_planner_keeps_its_indexes_alive(corpus):
 
     gc.collect()
     # If keep_alive were missing this would search freed memory.
-    plan = planner.explain(Predicate("price", CompareOp.Lt, 100), 10)
+    plan = planner.explain(Predicate("price", PredOp.Lt, 100), 10)
     assert plan.matched_rows == 100
 
 
@@ -306,7 +306,7 @@ def test_the_answer_does_not_depend_on_which_index_answered(built, corpus, kind)
 
     cut = price.key_cut_for_selectivity(0.1)
     found, _ = planner.search(
-        Predicate("price", CompareOp.Lt, cut), corpus.vectors.queries[0], k=10, ef=400
+        Predicate("price", PredOp.Lt, cut), corpus.vectors.queries[0], k=10, ef=400
     )
     assert [n.id for n in found] == oracle(built, corpus, cut, 10)
 
@@ -375,7 +375,7 @@ def test_post_filter_works_when_row_ids_are_not_in_key_order(built, corpus):
     cut = price.key_cut_for_selectivity(0.9)  # loose: post-filter should cope
     post = planner.search_with(
         PlanKind.PostFilter,
-        Predicate("price", CompareOp.Lt, cut),
+        Predicate("price", PredOp.Lt, cut),
         corpus.vectors.queries[0],
         k=10,
         ef=200,
@@ -413,7 +413,7 @@ def test_calibration_does_not_change_the_answers(built, corpus):
     planner = make_planner(built, threshold=0.5)
     _, _, price = built
     cut = price.key_cut_for_selectivity(0.3)
-    predicate = Predicate("price", CompareOp.Lt, cut)
+    predicate = Predicate("price", PredOp.Lt, cut)
 
     before = [n.id for n in planner.search(predicate, corpus.vectors.queries[0],
                                            k=10, ef=400)[0]]

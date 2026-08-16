@@ -299,6 +299,10 @@ public:
     // these agree; comparing them is cheaper than being wrong.
     virtual std::size_t row_space() const { return 0; }
 
+    // Whether bit position i means row id i. The precondition for handing a
+    // bit set to a vector index, which numbers its rows densely from zero.
+    virtual bool rows_are_dense() const { return false; }
+
     // Place a row under a value. Returns **false when this index cannot
     // represent the result and must be rebuilt**, never for an insert that
     // merely changed nothing.
@@ -698,6 +702,7 @@ public:
         return index_.decode(set);
     }
     std::size_t row_space() const override { return index_.rows(); }
+    bool rows_are_dense() const override { return index_.rows_are_dense(); }
 
     bool insert(const Datum& d, const ColumnValue& row) override {
         const T& value = datum_as<T>(d);
@@ -954,6 +959,7 @@ public:
         return index_->decode(set);
     }
     std::size_t row_space() const { return index_->row_space(); }
+    bool rows_are_dense() const { return index_->rows_are_dense(); }
 
     // --- int64 conveniences, unchanged from before the typed layer ----------
 

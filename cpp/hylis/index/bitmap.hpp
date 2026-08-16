@@ -244,6 +244,15 @@ public:
 
     std::size_t size() const { return live_; }
     std::size_t rows() const { return n_; }
+
+    // Whether position i *is* record key i.
+    //
+    // True when the keys are exactly 0..n-1, which is what an auto-increment
+    // id looks like. It is the precondition for handing a bit set straight to
+    // a vector index: those index by dense row id, and a bitmap's positions
+    // are only the same numbers when this holds. Otherwise the two number the
+    // same rows differently and a filtered search would keep the wrong ones.
+    bool rows_are_dense() const { return identity_rows_; }
     std::size_t distinct() const { return dictionary_.size(); }
     const std::vector<T>& dictionary() const { return dictionary_; }
 

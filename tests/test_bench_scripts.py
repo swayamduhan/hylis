@@ -330,6 +330,22 @@ def test_conjunction_experiment_compares_both_strategies():
     assert "IndexKind.Bitmap" in out, "the bitmap arm did not get a bitmap"
 
 
+def test_bitmap_planner_experiment_measures_both_claims():
+    """E5. planner.hpp states its own weakness -- it knows selectivity by
+    executing the predicate -- and a bitmap column is the case where that does
+    not apply. Two mechanisms, measured separately: explain() getting cheaper,
+    and the filtered search avoiding its setup. If either stops holding, the
+    BitmapFilteredGraph plan needs re-justifying."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_bitmap_planner.py", ["--quick"])
+    assert proc.returncode == 0, out
+    assert "explain tree" in out and "explain bitmap" in out
+    assert "MISMATCH" not in out, out
+    assert "Both arms returned identical rows" in out
+    assert "explain():" in out
+
+
 def test_printed_output_is_console_safe():
     """Windows consoles are cp1252 by default, and an em-dash in a print()
     has already cost this project one UnicodeEncodeError. Cheaper to assert
@@ -340,7 +356,8 @@ def test_printed_output_is_console_safe():
                    "experiment_double_rmi.py", "experiment_duplicate_keys.py",
                    "experiment_write_path.py",
                    "experiment_bitmap_cardinality.py",
-                   "experiment_conjunction.py"):
+                   "experiment_conjunction.py",
+                   "experiment_bitmap_planner.py"):
         text = (SCRIPTS / script).read_text(encoding="utf-8")
         for number, line in enumerate(text.split("\n"), start=1):
             stripped = line.lstrip()
@@ -358,7 +375,8 @@ def test_scripts_report_their_own_usage():
                    "experiment_double_rmi.py", "experiment_duplicate_keys.py",
                    "experiment_write_path.py",
                    "experiment_bitmap_cardinality.py",
-                   "experiment_conjunction.py"):
+                   "experiment_conjunction.py",
+                   "experiment_bitmap_planner.py"):
         proc, out = run(script, ["--help"])
         assert proc.returncode == 0, out
         assert "usage:" in out.lower()

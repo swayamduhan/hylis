@@ -47,7 +47,7 @@ except ImportError:
 
 try:
     from hylis import (
-        CompareOp,
+        PredOp,
         FlatIndex,
         HnswIndex,
         HybridPlanner,
@@ -163,7 +163,7 @@ def main(argv=None) -> int:
 
     for selectivity in SELECTIVITIES:
         cut = price.key_cut_for_selectivity(selectivity)
-        predicate = Predicate("price", CompareOp.Lt, cut)
+        predicate = Predicate("price", PredOp.Lt, cut)
         matched = planner.explain(predicate, args.k).matched_rows
         if matched <= args.k:
             continue  # every match is in the answer; there is no plan to pick

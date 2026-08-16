@@ -26,7 +26,8 @@
 using hylis::index::ColumnIndex;
 using hylis::index::ColumnKey;
 using hylis::index::ColumnValue;
-using hylis::index::CompareOp;
+using hylis::index::Datum;
+using hylis::query::PredOp;
 using hylis::index::FlatIndex;
 using hylis::index::HnswIndex;
 using hylis::index::Metric;
@@ -137,16 +138,16 @@ std::vector<std::int64_t> ids_of(const std::vector<Neighbor>& ns) {
 
 // The true answer, computed without the planner: filter by hand, then scan
 // the survivors exhaustively.
-std::vector<std::int64_t> oracle(const Corpus& c, CompareOp op, ColumnKey value,
+std::vector<std::int64_t> oracle(const Corpus& c, PredOp op, ColumnKey value,
                                  std::size_t k) {
     std::vector<std::int64_t> allowed;
     for (std::size_t row = 0; row < c.n; ++row) {
         const ColumnKey a = c.attribute[row];
-        const bool hit = (op == CompareOp::Eq && a == value) ||
-                         (op == CompareOp::Lt && a < value) ||
-                         (op == CompareOp::Le && a <= value) ||
-                         (op == CompareOp::Gt && a > value) ||
-                         (op == CompareOp::Ge && a >= value);
+        const bool hit = (op == PredOp::Eq && a == value) ||
+                         (op == PredOp::Lt && a < value) ||
+                         (op == PredOp::Le && a <= value) ||
+                         (op == PredOp::Gt && a > value) ||
+                         (op == PredOp::Ge && a >= value);
         if (hit) allowed.push_back(static_cast<std::int64_t>(row));
     }
     return ids_of(c.exact.search_filtered(c.query.data(), k, allowed));
@@ -160,7 +161,7 @@ TEST(HybridPlanner, AnswersAQueryNeitherIndexCouldAnswerAlone) {
     const Corpus c = make_corpus(4000, 16, 1);
     const HybridPlanner planner = make_planner(c);
 
-    Predicate p{"attr", CompareOp::Lt, 400};  // 10% of rows
+    Predicate p{"attr", PredOp::Lt, Datum{static_cast<std::int64_t>(400)}};  // 10% of rows
     QueryPlan plan;
     const auto got = planner.search(p, c.query.data(), 10, 64, &plan);
 
@@ -174,13 +175,13 @@ TEST(HybridPlanner, AnswersAQueryNeitherIndexCouldAnswerAlone) {
         EXPECT_LT(c.attribute[static_cast<std::size_t>(n.id)], 400)
             << "row " << n.id << " violates the predicate";
     }
-    EXPECT_EQ(ids_of(got), oracle(c, CompareOp::Lt, 400, 10));
+    EXPECT_EQ(ids_of(got), oracle(c, PredOp::Lt, 400, 10));
 }
 
 TEST(HybridPlanner, TheStructuredHalfIsAvailableOnItsOwn) {
     const Corpus c = make_corpus(2000, 8, 2);
     const HybridPlanner planner = make_planner(c);
-    const auto rows = planner.matching_rows({"attr", CompareOp::Lt, 250});
+    const auto rows = planner.matching_rows({"attr", PredOp::Lt, 250});
     EXPECT_EQ(rows.size(), 250u);
     for (ColumnValue row : rows) {
         EXPECT_LT(c.attribute[static_cast<std::size_t>(row)], 250);
@@ -197,14 +198,14 @@ TEST_P(PlanAgreement, EveryPlanReturnsTheSameRows) {
     const HybridPlanner planner = make_planner(c);
 
     const auto cut = static_cast<ColumnKey>(selectivity * static_cast<double>(c.n));
-    Predicate p{"attr", CompareOp::Lt, cut};
+    Predicate p{"attr", PredOp::Lt, Datum{static_cast<std::int64_t>(cut)}};
     const std::size_t k = 10;
 
     // ef high enough that the graph is not losing recall to beam width — the
     // question here is whether the plans agree, not how well HNSW is tuned.
     const auto pre = planner.search_with(PlanKind::PreFilter, p, c.query.data(), k, 400);
     const auto graph = planner.search_with(PlanKind::FilteredGraph, p, c.query.data(), k, 400);
-    const auto truth = oracle(c, CompareOp::Lt, cut, k);
+    const auto truth = oracle(c, PredOp::Lt, cut, k);
 
     EXPECT_EQ(ids_of(pre), truth) << "the exact plan disagreed with the oracle";
     EXPECT_EQ(ids_of(graph), truth)
@@ -221,12 +222,12 @@ TEST_P(PlanAgreement, ThePostFilterPlanIsAPrefixOfTheTruth) {
     const HybridPlanner planner = make_planner(c);
 
     const auto cut = static_cast<ColumnKey>(selectivity * static_cast<double>(c.n));
-    Predicate p{"attr", CompareOp::Lt, cut};
+    Predicate p{"attr", PredOp::Lt, Datum{static_cast<std::int64_t>(cut)}};
     const std::size_t k = 10;
 
     const auto post = ids_of(
         planner.search_with(PlanKind::PostFilter, p, c.query.data(), k, 400));
-    const auto truth = oracle(c, CompareOp::Lt, cut, k);
+    const auto truth = oracle(c, PredOp::Lt, cut, k);
 
     ASSERT_LE(post.size(), truth.size());
     for (std::size_t i = 0; i < post.size(); ++i) {
@@ -248,9 +249,9 @@ TEST(HybridPlanner, EveryPredicateAgreesWithTheOracle) {
     const std::size_t k = 8;
 
     for (ColumnKey cut : {ColumnKey{50}, ColumnKey{1500}, ColumnKey{2900}}) {
-        for (CompareOp op : {CompareOp::Lt, CompareOp::Le, CompareOp::Gt,
-                             CompareOp::Ge, CompareOp::Eq}) {
-            Predicate p{"attr", op, cut};
+        for (PredOp op : {PredOp::Lt, PredOp::Le, PredOp::Gt,
+                             PredOp::Ge, PredOp::Eq}) {
+            Predicate p{"attr", op, Datum{static_cast<std::int64_t>(cut)}};
             const auto got = ids_of(planner.search(p, c.query.data(), k, 400));
             EXPECT_EQ(got, oracle(c, op, cut, k))
                 << "op " << static_cast<int>(op) << " cut " << cut;
@@ -266,11 +267,11 @@ TEST(PlanChoice, TightPredicatesPreFilterAndLooseOnesDoNot) {
 
     // Well below the crossover: scanning 40 rows cannot lose to traversing a
     // graph that has to step through 3,960 rejects to stay connected.
-    EXPECT_EQ(planner.explain({"attr", CompareOp::Lt, 40}, 10).kind,
+    EXPECT_EQ(planner.explain({"attr", PredOp::Lt, 40}, 10).kind,
               PlanKind::PreFilter);
 
     // Well above it: the graph rejects almost nothing, so its speedup stands.
-    EXPECT_EQ(planner.explain({"attr", CompareOp::Lt, 3800}, 10).kind,
+    EXPECT_EQ(planner.explain({"attr", PredOp::Lt, 3800}, 10).kind,
               PlanKind::FilteredGraph);
 }
 
@@ -280,14 +281,14 @@ TEST(PlanChoice, FewerMatchesThanKIsAlwaysAScan) {
 
     // threshold 0 would normally force the graph, but when every match is
     // going into the answer anyway there is nothing for a graph to prune.
-    const QueryPlan plan = planner.explain({"attr", CompareOp::Lt, 5}, 10);
+    const QueryPlan plan = planner.explain({"attr", PredOp::Lt, 5}, 10);
     EXPECT_EQ(plan.kind, PlanKind::PreFilter);
     EXPECT_NE(plan.reason.find("do not exceed k"), std::string::npos);
 }
 
 TEST(PlanChoice, TheThresholdIsWhatMoves) {
     const Corpus c = make_corpus(3000, 8, 8);
-    Predicate p{"attr", CompareOp::Lt, 900};  // 30%
+    Predicate p{"attr", PredOp::Lt, Datum{static_cast<std::int64_t>(900)}};  // 30%
 
     EXPECT_EQ(make_planner(c, 0.5).explain(p, 10).kind, PlanKind::PreFilter);
     EXPECT_EQ(make_planner(c, 0.1).explain(p, 10).kind, PlanKind::FilteredGraph);
@@ -296,7 +297,7 @@ TEST(PlanChoice, TheThresholdIsWhatMoves) {
 TEST(PlanChoice, ExplainsItself) {
     const Corpus c = make_corpus(2000, 8, 9);
     const HybridPlanner planner = make_planner(c);
-    const QueryPlan plan = planner.explain({"attr", CompareOp::Lt, 100}, 10);
+    const QueryPlan plan = planner.explain({"attr", PredOp::Lt, 100}, 10);
     // A planner that cannot say why is not defensible in a report.
     EXPECT_FALSE(plan.reason.empty());
     EXPECT_NE(plan.reason.find("crossover"), std::string::npos);
@@ -309,7 +310,7 @@ TEST(HybridPlanner, APredicateMatchingNothingSkipsTheVectorWorkEntirely) {
     const HybridPlanner planner = make_planner(c);
 
     QueryPlan plan;
-    const auto got = planner.search({"attr", CompareOp::Lt, 0}, c.query.data(),
+    const auto got = planner.search({"attr", PredOp::Lt, 0}, c.query.data(),
                                     10, 64, &plan);
     EXPECT_TRUE(got.empty());
     EXPECT_EQ(plan.matched_rows, 0u);
@@ -319,7 +320,7 @@ TEST(HybridPlanner, APredicateMatchingNothingSkipsTheVectorWorkEntirely) {
 TEST(HybridPlanner, KLargerThanTheMatchCountReturnsEveryMatch) {
     const Corpus c = make_corpus(1000, 8, 11);
     const HybridPlanner planner = make_planner(c);
-    const auto got = planner.search({"attr", CompareOp::Lt, 7}, c.query.data(),
+    const auto got = planner.search({"attr", PredOp::Lt, 7}, c.query.data(),
                                     50, 64);
     EXPECT_EQ(got.size(), 7u);
 }
@@ -327,14 +328,14 @@ TEST(HybridPlanner, KLargerThanTheMatchCountReturnsEveryMatch) {
 TEST(HybridPlanner, KOfZeroReturnsNothingRatherThanEverything) {
     const Corpus c = make_corpus(500, 8, 12);
     const HybridPlanner planner = make_planner(c);
-    EXPECT_TRUE(planner.search({"attr", CompareOp::Lt, 100}, c.query.data(), 0).empty());
+    EXPECT_TRUE(planner.search({"attr", PredOp::Lt, 100}, c.query.data(), 0).empty());
 }
 
 TEST(HybridPlanner, AnUnknownColumnSaysWhichOnesExist) {
     const Corpus c = make_corpus(500, 8, 13);
     const HybridPlanner planner = make_planner(c);
     try {
-        planner.matching_rows({"nosuch", CompareOp::Lt, 10});
+        planner.matching_rows({"nosuch", PredOp::Lt, 10});
         FAIL() << "an unknown column should not be silently empty";
     } catch (const std::invalid_argument& e) {
         EXPECT_NE(std::string(e.what()).find("attr"), std::string::npos)
@@ -349,9 +350,9 @@ TEST(HybridPlanner, WorksWithNoGraphAttached) {
     planner.set_exact(&c.exact);
     // No graph: every plan must fall back to the exact index rather than
     // dereferencing a null one.
-    const QueryPlan plan = planner.explain({"attr", CompareOp::Lt, 1400}, 10);
+    const QueryPlan plan = planner.explain({"attr", PredOp::Lt, 1400}, 10);
     EXPECT_EQ(plan.kind, PlanKind::PreFilter);
-    EXPECT_EQ(planner.search({"attr", CompareOp::Lt, 1400}, c.query.data(), 10).size(),
+    EXPECT_EQ(planner.search({"attr", PredOp::Lt, 1400}, c.query.data(), 10).size(),
               10u);
 }
 
@@ -361,7 +362,7 @@ TEST(HybridPlanner, AsksForAGraphPlanWithoutAGraphAndIsTold) {
     planner.set_column("attr", attribute_column(c));
     planner.set_exact(&c.exact);
     EXPECT_THROW(planner.search_with(PlanKind::FilteredGraph,
-                                     {"attr", CompareOp::Lt, 400},
+                                     {"attr", PredOp::Lt, 400},
                                      c.query.data(), 10),
                  std::logic_error);
 }
@@ -393,7 +394,7 @@ TEST(HybridPlanner, HoldsAnyIndexKindBehindTheSameInterface) {
         planner.set_column("attr", ColumnIndex::build_with(keys, values, plan));
         planner.set_exact(&c.exact);
         planner.set_graph(&c.graph);
-        answers[i] = ids_of(planner.search({"attr", CompareOp::Lt, 500},
+        answers[i] = ids_of(planner.search({"attr", PredOp::Lt, 500},
                                            c.query.data(), 10, 400));
     }
     EXPECT_EQ(answers[0], answers[1]) << "B+ tree and RMI gave different rows";
@@ -411,9 +412,9 @@ TEST(PlannerUsefulness, ChoosesTheFasterPlanAtBothEnds) {
     const std::size_t k = 10;
 
     auto time_plan = [&](PlanKind kind, ColumnKey cut) {
-        Predicate p{"attr", kind == PlanKind::PostFilter ? CompareOp::Lt
-                                                         : CompareOp::Lt,
-                    cut};
+        Predicate p{"attr", kind == PlanKind::PostFilter ? PredOp::Lt
+                                                         : PredOp::Lt,
+                    Datum{static_cast<std::int64_t>(cut)}};
         // Warm, then measure: the first call pays for cold caches on
         // whichever plan happens to run first.
         planner.search_with(kind, p, c.query.data(), k, 64);
@@ -432,7 +433,7 @@ TEST(PlannerUsefulness, ChoosesTheFasterPlanAtBothEnds) {
         << "the measured crossover says a scan wins at 0.5% selectivity; if "
            "this fails the planner's threshold is calibrated to the wrong "
            "machine, not merely unlucky";
-    EXPECT_EQ(planner.explain({"attr", CompareOp::Lt, tight}, k).kind,
+    EXPECT_EQ(planner.explain({"attr", PredOp::Lt, tight}, k).kind,
               PlanKind::PreFilter);
 
     // Loose predicate: 95% of rows. The graph should win.
@@ -442,6 +443,187 @@ TEST(PlannerUsefulness, ChoosesTheFasterPlanAtBothEnds) {
     EXPECT_LT(loose_graph, loose_scan)
         << "the graph lost even at 95% selectivity, where it rejects almost "
            "nothing — that would mean the graph is never worth choosing";
-    EXPECT_EQ(planner.explain({"attr", CompareOp::Lt, loose}, k).kind,
+    EXPECT_EQ(planner.explain({"attr", PredOp::Lt, loose}, k).kind,
               PlanKind::FilteredGraph);
+}
+
+// ---------------------------------------------------------------------------
+// The bitmap-filtered graph plan
+// ---------------------------------------------------------------------------
+//
+// Two claims, and only the second is about speed.
+//
+// **The rows are the same.** A plan that returned different rows would not be
+// a cheaper way of answering the query, it would be a different query.
+//
+// **The selectivity was free.** planner.hpp states its own weakness at the
+// top: it knows selectivity exactly because it *executes* the predicate first,
+// so "a predicate matching nearly everything is paid for in full before the
+// planner can discover it should have post-filtered". A bitmap column answers
+// by popcount and materialises nothing, and `selectivity_was_free` is how a
+// caller can tell that case apart.
+
+namespace {
+
+// A bitmap column over a low-cardinality attribute, built over the corpus's
+// whole row space so its bit positions are the vector index's row ids.
+ColumnIndex bucket_column(const Corpus& c, std::size_t buckets) {
+    std::vector<std::pair<ColumnKey, ColumnValue>> pairs;
+    for (std::size_t row = 0; row < c.n; ++row) {
+        pairs.emplace_back(
+            static_cast<ColumnKey>(c.attribute[row] % static_cast<ColumnKey>(buckets)),
+            static_cast<ColumnValue>(row));
+    }
+    std::sort(pairs.begin(), pairs.end());
+
+    std::vector<ColumnKey> keys;
+    std::vector<ColumnValue> rows;
+    std::vector<ColumnValue> space;
+    for (const auto& [value, row] : pairs) {
+        keys.push_back(value);
+        rows.push_back(row);
+    }
+    for (std::size_t row = 0; row < c.n; ++row) {
+        space.push_back(static_cast<ColumnValue>(row));
+    }
+
+    hylis::index::IndexPlan plan;
+    plan.kind = hylis::index::IndexKind::Bitmap;
+    plan.type = hylis::index::LogicalType::Int64;
+    plan.encoding = hylis::index::KeyEncoding::Dictionary;
+    return ColumnIndex::build_typed_with(hylis::index::LogicalType::Int64, keys,
+                                         rows, plan, &space);
+}
+
+}  // namespace
+
+TEST(BitmapPlan, SelectivityIsFreeAndThePlanSaysSo) {
+    Corpus c = make_corpus(4000, 16, 11);
+    HybridPlanner planner(0.2);
+    planner.set_column("bucket", bucket_column(c, 10));
+    planner.set_exact(&c.exact);
+    planner.set_graph(&c.graph);
+
+    // 8 of 10 buckets: 80% selectivity, well above the crossover.
+    const Predicate loose{"bucket", PredOp::Lt, Datum{static_cast<std::int64_t>(8)}};
+    const QueryPlan plan = planner.explain(loose, 10);
+
+    EXPECT_TRUE(plan.selectivity_was_free);
+    EXPECT_EQ(plan.kind, PlanKind::BitmapFilteredGraph);
+    EXPECT_NEAR(plan.selectivity, 0.8, 0.02);
+    EXPECT_NE(plan.reason.find("no row id is materialised"), std::string::npos)
+        << plan.reason;
+}
+
+TEST(BitmapPlan, AnOrderedColumnHasToExecuteToKnowItsSelectivity) {
+    // The contrast that makes the flag mean something.
+    Corpus c = make_corpus(4000, 16, 11);
+    HybridPlanner planner(0.2);
+    planner.set_column("attr", attribute_column(c));
+    planner.set_exact(&c.exact);
+    planner.set_graph(&c.graph);
+
+    const Predicate loose{"attr", PredOp::Lt,
+                          Datum{static_cast<std::int64_t>(3200)}};
+    const QueryPlan plan = planner.explain(loose, 10);
+    EXPECT_FALSE(plan.selectivity_was_free);
+    EXPECT_EQ(plan.kind, PlanKind::FilteredGraph);
+}
+
+TEST(BitmapPlan, TheRowsMatchTheIdListPlan) {
+    Corpus c = make_corpus(4000, 16, 12);
+    HybridPlanner planner(0.2);
+    planner.set_column("bucket", bucket_column(c, 10));
+    planner.set_exact(&c.exact);
+    planner.set_graph(&c.graph);
+
+    for (std::int64_t cut : {1, 4, 8, 10}) {
+        const Predicate p{"bucket", PredOp::Lt, Datum{cut}};
+        const auto masked =
+            planner.search_with(PlanKind::BitmapFilteredGraph, p, c.query.data(), 10, 64);
+        const auto listed =
+            planner.search_with(PlanKind::FilteredGraph, p, c.query.data(), 10, 64);
+        EXPECT_EQ(ids_of(masked), ids_of(listed)) << "cut " << cut;
+    }
+}
+
+TEST(BitmapPlan, EveryPlanStillAgreesWithTheOracle) {
+    Corpus c = make_corpus(3000, 16, 13);
+    HybridPlanner planner(0.2);
+    planner.set_column("bucket", bucket_column(c, 8));
+    planner.set_exact(&c.exact);
+    planner.set_graph(&c.graph);
+
+    for (std::int64_t cut : {2, 6}) {
+        const Predicate p{"bucket", PredOp::Lt, Datum{cut}};
+        std::vector<std::int64_t> allowed;
+        for (std::size_t row = 0; row < c.n; ++row) {
+            if (c.attribute[row] % 8 < cut) {
+                allowed.push_back(static_cast<std::int64_t>(row));
+            }
+        }
+        const auto want = ids_of(c.exact.search_filtered(c.query.data(), 10, allowed));
+        const auto got =
+            planner.search_with(PlanKind::PreFilter, p, c.query.data(), 10, 64);
+        EXPECT_EQ(ids_of(got), want) << "cut " << cut;
+    }
+}
+
+TEST(BitmapPlan, AnOrderedColumnCannotRunItAndSaysSo) {
+    // The bit set has to line up with the vector index's row ids. A tree has
+    // none to give, and answering with a silently different filter would be
+    // far worse than refusing.
+    Corpus c = make_corpus(1000, 8, 14);
+    HybridPlanner planner(0.2);
+    planner.set_column("attr", attribute_column(c));
+    planner.set_exact(&c.exact);
+    planner.set_graph(&c.graph);
+
+    const Predicate p{"attr", PredOp::Lt, Datum{static_cast<std::int64_t>(500)}};
+    EXPECT_FALSE(planner.plan_available(PlanKind::BitmapFilteredGraph, p));
+    EXPECT_THROW(
+        planner.search_with(PlanKind::BitmapFilteredGraph, p, c.query.data(), 10),
+        std::invalid_argument);
+    EXPECT_TRUE(planner.plan_available(PlanKind::FilteredGraph, p));
+}
+
+TEST(BitmapPlan, RowsSuppliedByTheCallerAreStillPlanned) {
+    // The seam for everything the planner cannot express: a conjunction Table
+    // resolved, or a Contains it had to scan for.
+    Corpus c = make_corpus(2000, 16, 15);
+    HybridPlanner planner(0.2);
+    planner.set_exact(&c.exact);
+    planner.set_graph(&c.graph);
+
+    std::vector<std::int64_t> few;
+    for (std::size_t row = 0; row < 40; ++row) {
+        few.push_back(static_cast<std::int64_t>(row));
+    }
+    QueryPlan plan;
+    const auto got = planner.search_rows(few, c.query.data(), 10, 64, &plan);
+    EXPECT_EQ(plan.kind, PlanKind::PreFilter) << plan.reason;
+    EXPECT_EQ(ids_of(got),
+              ids_of(c.exact.search_filtered(c.query.data(), 10, few)));
+}
+
+TEST(BitmapPlan, MaskedSearchMatchesTheIdListOnTheGraphItself) {
+    // One level down: the two HnswIndex entry points must agree before any
+    // plan built on them can.
+    Corpus c = make_corpus(2000, 16, 16);
+    std::vector<std::int64_t> allowed;
+    hylis::index::Bitset mask(c.n);
+    for (std::size_t row = 0; row < c.n; row += 3) {
+        allowed.push_back(static_cast<std::int64_t>(row));
+        mask.set(row);
+    }
+
+    for (std::size_t ef : {16u, 64u}) {
+        const auto listed = c.graph.search_filtered(c.query.data(), 10, allowed, ef);
+        const auto masked = c.graph.search_masked(c.query.data(), 10, mask, ef);
+        EXPECT_EQ(ids_of(listed), ids_of(masked)) << "ef " << ef;
+    }
+
+    const auto flat_listed = c.exact.search_filtered(c.query.data(), 10, allowed);
+    const auto flat_masked = c.exact.search_masked(c.query.data(), 10, mask);
+    EXPECT_EQ(ids_of(flat_listed), ids_of(flat_masked));
 }

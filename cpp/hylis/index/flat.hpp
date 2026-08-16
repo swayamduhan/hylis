@@ -61,6 +61,7 @@
 // Metric, Neighbor, the scoring loop and the bounded top-k heap are shared
 // with the HNSW index — see the header for why one implementation matters
 // when the two are benchmarked against each other.
+#include "index/bitmap.hpp"
 #include "index/distance.hpp"
 
 namespace hylis::index {
@@ -159,6 +160,36 @@ public:
                                           const std::vector<std::int64_t>& allowed) const {
         require_dim(query.size());
         return search_filtered(query.data(), k, allowed);
+    }
+
+    // The same scan, driven by a bit set instead of an id list.
+    //
+    // A separate name rather than an overload: `search_filtered(q, k, {})`
+    // is viable for both an empty id list and an empty bit set, so the
+    // overload set was genuinely ambiguous. The distinct name also carries
+    // the precondition, which an overload would have hidden.
+    //
+    // What it saves is the *materialisation*: a bitmap column would otherwise
+    // have to decode its matching rows into a vector before this could be
+    // called, which is O(matches) of allocation and copying per query, thrown
+    // away immediately afterwards. Iterating the set bits does the same walk
+    // without ever building the list.
+    //
+    // Bit position i means row id i, which is only true when the bitmap's rows
+    // are dense — see ColumnIndex::rows_are_dense(). The caller checks;
+    // getting it wrong would silently filter on the wrong rows.
+    std::vector<Neighbor> search_masked(const float* query, std::size_t k,
+                                        const Bitset& allowed) const {
+        TopK top(k);
+        if (k == 0 || allowed.size() == 0) return top.drain();
+
+        std::vector<float> scratch;
+        const float* q = prepare_query(query, scratch);
+        const std::size_t n = size();
+        allowed.for_each([&](std::size_t id) {
+            if (id < n) top.offer(static_cast<std::int64_t>(id), score_row(q, id));
+        });
+        return finish(top);
     }
 
     // Search n_queries queries laid out row-major.

@@ -638,6 +638,11 @@ private:
                 : catalog_.build_column_typed(name, type, keys, rows,
                                               column->workload, nullptr,
                                               &row_space);
+        // A forced structure is recorded too. It skipped the measurement, not
+        // the decision -- and a decision the catalog does not hold is one that
+        // silently reverts on the next reopen, which is worse than never having
+        // made it.
+        if (column->force) catalog_.set(name, built.plan());
         column->index = std::make_unique<ColumnIndex>(std::move(built));
         column->dirty = false;
         (void)skipped;  // reported by info_of() from the store, not tracked

@@ -80,30 +80,22 @@ PYBIND11_MODULE(_planner, m) {
                "Run the predicate, then beam-search the graph rejecting\n"
                "non-matches. Gets more expensive as a predicate tightens,\n"
                "because the graph must step through rejects to stay connected.")
+        .value("BitmapFilteredGraph", PlanKind::BitmapFilteredGraph,
+               "The same traversal, with a bitmap column's bit set used\n"
+               "directly as the mask. Saves decoding every matching row id\n"
+               "into a list and then stamping it -- O(matches) of setup per\n"
+               "query -- not the membership test, which was already O(1).")
         .value("PostFilter", PlanKind::PostFilter,
                "Search unfiltered, then drop non-matches.\n\n"
                "Included because it is the trap, not because it wins: it is\n"
                "what a system without a planner does, and it can silently\n"
                "return fewer than k rows.");
 
-    py::class_<Predicate>(m, "Predicate", "One structured constraint.")
-        .def(py::init<>())
-        .def(py::init([](std::string column, CompareOp op, ColumnKey value) {
-                 Predicate p;
-                 p.column = std::move(column);
-                 p.op = op;
-                 p.value = value;
-                 return p;
-             }),
-             py::arg("column"), py::arg("op"), py::arg("value"))
-        .def_readwrite("column", &Predicate::column)
-        .def_readwrite("op", &Predicate::op)
-        .def_readwrite("value", &Predicate::value)
-        .def("__repr__", [](const Predicate& p) {
-            return "Predicate(" + p.column + " " +
-                   std::string(hylis::index::symbol_of(p.op)) + " " +
-                   std::to_string(p.value) + ")";
-        });
+    // Predicate is bound by hylis._table, which owns query/predicate.hpp's
+    // type. Registering it twice would be a runtime conflict, and the two were
+    // separate structs until phase D unified them -- which is what let the
+    // planner and the table finally appear in one program.
+    py::module_::import("hylis._table");
 
     py::class_<QueryPlan>(m, "QueryPlan",
         "The decision, and the evidence behind it.")
@@ -114,6 +106,12 @@ PYBIND11_MODULE(_planner, m) {
         .def_readonly("corpus_rows", &QueryPlan::corpus_rows)
         .def_readonly("selectivity", &QueryPlan::selectivity)
         .def_readonly("threshold", &QueryPlan::threshold)
+        .def_readonly("selectivity_was_free", &QueryPlan::selectivity_was_free,
+                      "Whether the selectivity was known without executing the\n"
+                      "predicate. True only for a bitmap column aligned to the\n"
+                      "corpus, which answers by popcount -- the one case where\n"
+                      "this planner's execute-then-decide weakness does not\n"
+                      "apply.")
         .def_readonly("reason", &QueryPlan::reason,
                       "Why this plan, in words. A planner that cannot say why\n"
                       "is not defensible in a report.")
@@ -174,6 +172,46 @@ PYBIND11_MODULE(_planner, m) {
            "Attach a column with the structure named rather than measured.\n"
            "For showing that the planner's answers do not depend on which\n"
            "index answered.")
+        .def("set_column_index", [](HybridPlanner& self, const std::string& name,
+                                    hylis::index::LogicalType type,
+                                    const std::vector<ColumnKey>& keys,
+                                    const std::vector<hylis::index::ColumnValue>& values,
+                                    const hylis::index::IndexPlan& plan,
+                                    py::object row_space) {
+            std::vector<hylis::index::ColumnValue> space;
+            const std::vector<hylis::index::ColumnValue>* space_ptr = nullptr;
+            if (!row_space.is_none()) {
+                space = row_space.cast<std::vector<hylis::index::ColumnValue>>();
+                space_ptr = &space;
+            }
+            self.set_column(name, ColumnIndex::build_typed_with(type, keys, values,
+                                                                plan, space_ptr));
+        }, py::arg("name"), py::arg("type"), py::arg("keys"), py::arg("values"),
+           py::arg("plan"), py::arg("row_space") = py::none(),
+           "Attach a column built to an exact plan.\n\n"
+           "`row_space` is every row the corpus holds, and a bitmap column\n"
+           "needs it: bit position i must mean row id i for the graph to take\n"
+           "the bit set as a mask, which is only true when the bitmap covers\n"
+           "the whole corpus densely. Passing None leaves the column covering\n"
+           "only the rows that carry a value, which is correct but cannot be\n"
+           "used as a mask.")
+        .def("plan_available", &HybridPlanner::plan_available,
+             py::arg("kind"), py::arg("predicate"),
+             "Whether a plan can run for this predicate at all.\n"
+             "BitmapFilteredGraph needs a bitmap column aligned to the corpus.")
+        .def("search_rows", [](const HybridPlanner& self,
+                               const std::vector<hylis::index::ColumnValue>& rows,
+                               py::array_t<float, py::array::c_style |
+                                                  py::array::forcecast> query,
+                               std::size_t k, std::size_t ef) {
+            hylis::query::QueryPlan plan;
+            auto out = self.search_rows(rows, query.data(), k, ef, &plan);
+            return py::make_tuple(std::move(out), plan);
+        }, py::arg("rows"), py::arg("query"), py::arg("k") = 10, py::arg("ef") = 0,
+           "Plan and run over row ids the caller already has.\n\n"
+           "The seam for everything the planner cannot express itself: a\n"
+           "conjunction Table resolved, a Contains it had to scan for, or a\n"
+           "hand-built filter. Same plan choice, different source of rows.")
         .def("has_column", &HybridPlanner::has_column, py::arg("name"))
         .def("columns", &HybridPlanner::columns)
         .def("set_exact", &HybridPlanner::set_exact, py::arg("index"),

@@ -28,6 +28,7 @@ from hylis.index import (  # noqa: F401
 from hylis.query import (  # noqa: F401
     HybridPlanner,
     PlanKind,
+    PredOp,
     Predicate,
     QueryPlan,
 )
@@ -47,7 +48,6 @@ from hylis.schema import (  # noqa: F401
 from hylis.storage import Record, RecordStore  # noqa: F401
 from hylis.table import (  # noqa: F401
     ColumnInfo,
-    PredOp,
     QueryTrace,
     Table,
     WriteResult,

@@ -23,9 +23,9 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 | 6 | Neural Router       | ✅ |
 | 7 | Incremental retrain | ✅ |
 | 8 | Query planner       | ✅ |
-| 9 | Typed columns       | ◐ phases A–C of 5 |
+| 9 | Typed columns       | ◐ phases A–D of 5 |
 | 10| Benchmarks          | ☐ |
-| 11| Demo CLI            | ☐ |
+| 11| Demo CLI            | ✅ |
 
 ## What is left, and why in this order
 
@@ -60,8 +60,9 @@ limitation this README already states below: insertion still descends the
 hierarchy, which is why the layer-0-only build does not scale. Highest research
 value, highest risk.
 
-**5. Modules 10 and 11 are largely done** — eleven benchmark scripts and two
-interactive REPLs exist. What remains is consolidation, not new work.
+**5. ~~Module 11, the demo CLI.~~** ✅ Done — `scripts/try_hybrid.py`, below.
+Module 10 is largely done too: fourteen benchmark and experiment scripts exist,
+and what remains is consolidation rather than new work.
 
 ## Typed columns
 
@@ -191,6 +192,48 @@ is not. Below that almost nothing matches and the merge wins.
 One honest gap, and it is why `create_index_as` exists: `choose_index` times
 lookups and writes, not `count()`, so a counting workload is judged on the one
 operation the bitmap is worst at.
+
+## The demo
+
+```bash
+python scripts/try_hybrid.py --demo     # the whole system in one screen
+python scripts/try_hybrid.py --load 20000
+```
+
+The other two playgrounds each show one module. This one shows the join — a
+durable store, per-column indexes chosen by measurement, a predicate, a vector
+search over the survivors, and the planner's own account of why:
+
+```
+> explain price lt 45000 10   -> FilteredGraph,       deciding took 141.9 us
+> explain band  lt 4     10   -> BitmapFilteredGraph, deciding took   8.0 us
+
+> plans band lt 4 5
+    plan                            us   rows   agrees
+    PreFilter                      229      5      yes
+    FilteredGraph                   46      5      yes
+    BitmapFilteredGraph             18      5      yes
+    PostFilter                      98      5      yes
+
+> recover
+    20,000 records recovered from the write-ahead log
+    price: rebuilt by replaying the stored plan, not re-measuring it
+```
+
+`recover` is the moment worth watching: the rows come back from module 1 and
+the *decisions* come back from module 4, without the expensive half repeating.
+
+**E5** measures what a bitmap column buys the planner. `explain()` gets
+**1.5×–7.9× cheaper, and the gain grows with selectivity** — which is exactly
+the weakness `planner.hpp` states about itself, since it knows selectivity by
+*executing* the predicate. A popcount does not care how many bits are set.
+
+The filtered search itself gains only 1.06×–1.50×, and that is consistent with
+a correction worth recording: the design note claimed the win would be an O(1)
+bit test replacing an O(log m) binary search per visited node. There was no
+such search — HNSW already tested in O(1) against an epoch array. What the mask
+actually avoids is the *setup*: decoding every matching row into a list and
+marking it, before the search starts.
 
 ### The framing these add up to
 

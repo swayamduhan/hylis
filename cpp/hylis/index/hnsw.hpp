@@ -58,6 +58,7 @@
 #include <string>
 #include <vector>
 
+#include "index/bitmap.hpp"
 #include "index/distance.hpp"
 #include "index/router.hpp"
 
@@ -459,6 +460,36 @@ public:
                                           bool use_router = false) const {
         require_dim(query.size());
         return search_filtered(query.data(), k, allowed, ef, use_router);
+    }
+
+    // The same filtered traversal, driven by a bit set.
+    //
+    // A separate name rather than an overload, for the same reason as
+    // FlatIndex::search_masked: `{}` is viable for both.
+    //
+    // What this saves is **not** the membership test. The id-list overload
+    // above already stamps an epoch array and tests it in O(1) per visited
+    // node — the design note that proposed this expected to be replacing an
+    // O(log m) binary search, and no such search was there. What it saves is
+    // the setup: decoding a bitmap column's matches into a vector and then
+    // marking every one of them, which is O(matches) per query before the
+    // search begins. At 90% selectivity over a million rows that is 900,000
+    // decodes and 900,000 stores to answer one query, and the bit set is
+    // already exactly the mark array the search wants.
+    //
+    // Bit position i means row id i, which holds only when the bitmap's rows
+    // are dense. The caller checks — see ColumnIndex::rows_are_dense().
+    std::vector<Neighbor> search_masked(const float* query, std::size_t k,
+                                        const Bitset& allowed,
+                                        std::size_t ef = 0,
+                                        bool use_router = false) const {
+        if (k == 0 || count_ == 0 || allowed.size() == 0) return {};
+        const std::size_t bits = allowed.size();
+        return search_impl(query, k, ef,
+                           [&allowed, bits](std::uint32_t id) {
+                               return id < bits && allowed.test(id);
+                           },
+                           use_router);
     }
 
     std::vector<std::vector<Neighbor>> search_batch(const float* queries,

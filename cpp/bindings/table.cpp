@@ -114,6 +114,23 @@ PYBIND11_MODULE(_table, m) {
     m.def("op_is_indexable", &hylis::query::op_is_indexable, py::arg("op"),
           "Whether an ordered index can answer this operator directly.");
 
+    // Bound here rather than in _planner because query/predicate.hpp is the
+    // query layer's shared type: the planner and the table used to have one
+    // Predicate each, which meant they could never appear in the same program.
+    py::class_<Predicate>(m, "Predicate", "One structured constraint.")
+        .def(py::init([](std::string column, PredOp op, py::handle value,
+                         py::handle value2) {
+                 return predicate_from_py(std::move(column), op, value, value2);
+             }),
+             py::arg("column"), py::arg("op"), py::arg("value") = py::none(),
+             py::arg("value2") = py::none())
+        .def_readonly("column", &Predicate::column)
+        .def_readonly("op", &Predicate::op)
+        .def("__repr__", [](const Predicate& p) {
+            return "Predicate(" + p.column + " " +
+                   std::string(hylis::query::to_string(p.op)) + ")";
+        });
+
     py::class_<ColumnInfo>(m, "ColumnInfo", "A column, and what indexes it.")
         .def_readonly("name", &ColumnInfo::name)
         .def_readonly("type", &ColumnInfo::type)
@@ -191,6 +208,12 @@ PYBIND11_MODULE(_table, m) {
 
         // --- DDL ---
         .def_property_readonly("schema", &Table::schema)
+        .def_property_readonly("catalog", &Table::catalog,
+                               py::return_value_policy::reference_internal,
+                               "The persisted decisions. Plans, never the\n"
+                               "fitted models: a model rebuilds in milliseconds,\n"
+                               "while producing a plan means building and timing\n"
+                               "every candidate.")
         .def("add_column", &Table::add_column, py::arg("column"))
         .def("create_index", [](Table& self, const std::string& name,
                                 double write_fraction) {

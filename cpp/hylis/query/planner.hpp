@@ -68,32 +68,41 @@
 #include "index/distance.hpp"
 #include "index/flat.hpp"
 #include "index/hnsw.hpp"
+#include "query/predicate.hpp"
 
 namespace hylis::query {
 
+using hylis::index::Bitset;
 using hylis::index::ColumnIndex;
 using hylis::index::ColumnKey;
 using hylis::index::ColumnValue;
 using hylis::index::CompareOp;
+using hylis::index::Datum;
 using hylis::index::FlatIndex;
 using hylis::index::HnswIndex;
 using hylis::index::Neighbor;
 
-// One structured constraint. Deliberately a single predicate rather than a
-// conjunction: two predicates are set intersection over the row-id lists and
-// introduce no new decision, so they would add surface without adding a
-// question the planner has to answer.
-struct Predicate {
-    std::string column;
-    CompareOp op = CompareOp::Lt;
-    ColumnKey value = 0;
-};
+// The predicate type is query/predicate.hpp's, shared with Table.
+//
+// It used to be a separate struct here, holding a CompareOp and a bare int64.
+// Two Predicate types in one namespace could not both be included, so the
+// planner and the table could not appear in the same translation unit -- which
+// is exactly what a demo of the whole system has to do. Unifying them also
+// gives the planner Prefix and Between for free, and makes the value typed
+// rather than "whatever int64 the caller encoded it as".
+//
+// The single-predicate restriction is lifted with it. The original reason --
+// that two predicates are set intersection and introduce no new decision --
+// stopped being true when bitmaps arrived: a word-parallel AND costs O(n/64)
+// whatever matches, where a merge costs O(m1 + m2). Table owns that choice
+// (see select_all); the planner consumes its answer.
 
 enum class PlanKind {
-    NoPredicate,    // unconstrained similarity search
-    PreFilter,      // predicate, then an exact scan of the survivors
-    FilteredGraph,  // predicate, then a beam search rejecting non-matches
-    PostFilter,     // unfiltered graph search, then drop non-matches
+    NoPredicate,          // unconstrained similarity search
+    PreFilter,            // predicate, then an exact scan of the survivors
+    FilteredGraph,        // predicate, then a beam search rejecting non-matches
+    BitmapFilteredGraph,  // the same, with the bit set used directly as the mask
+    PostFilter,           // unfiltered graph search, then drop non-matches
 };
 
 inline const char* to_string(PlanKind kind) {
@@ -101,6 +110,7 @@ inline const char* to_string(PlanKind kind) {
         case PlanKind::NoPredicate: return "no_predicate";
         case PlanKind::PreFilter: return "pre_filter";
         case PlanKind::FilteredGraph: return "filtered_graph";
+        case PlanKind::BitmapFilteredGraph: return "bitmap_filtered_graph";
         case PlanKind::PostFilter: return "post_filter";
     }
     return "?";
@@ -116,6 +126,16 @@ struct QueryPlan {
     double selectivity = 1.0;
     double threshold = 0.5;
     std::string reason;
+
+    // Whether the selectivity above was known without executing the predicate.
+    //
+    // This file already states its own weakness: the planner knows selectivity
+    // exactly because it *executes* first, so "a predicate matching nearly
+    // everything is paid for in full before the planner can discover it should
+    // have post-filtered". A bitmap column answers by popcount and materialises
+    // nothing, which is the case where that weakness does not apply -- and the
+    // flag is how a caller can tell the two apart.
+    bool selectivity_was_free = false;
 };
 
 class HybridPlanner {
@@ -222,7 +242,8 @@ public:
     // Run the predicate and decide, without doing the vector work.
     QueryPlan explain(const Predicate& predicate, std::size_t k) const {
         std::vector<ColumnValue> matched;
-        return plan_for(predicate, k, &matched);
+        Bitset mask;
+        return plan_for(predicate, k, &matched, &mask);
     }
 
     // The whole point of the module.
@@ -230,9 +251,17 @@ public:
                                  std::size_t k, std::size_t ef = 0,
                                  QueryPlan* out_plan = nullptr) const {
         std::vector<ColumnValue> matched;
-        const QueryPlan plan = plan_for(predicate, k, &matched);
+        Bitset mask;
+        const QueryPlan plan = plan_for(predicate, k, &matched, &mask);
         if (out_plan) *out_plan = plan;
-        return execute(plan.kind, matched, query, k, ef, predicate);
+        // Every plan but the bitmap one needs the rows themselves, and a free
+        // selectivity means they were never produced. This is where the saving
+        // is given back when the plan turns out to want them.
+        if (plan.kind != PlanKind::BitmapFilteredGraph && matched.empty() &&
+            plan.matched_rows != 0) {
+            matched = matching_rows(predicate);
+        }
+        return execute(plan.kind, matched, mask, query, k, ef);
     }
 
     // Force a plan. Exists so tests can assert every plan returns the same
@@ -242,8 +271,18 @@ public:
     std::vector<Neighbor> search_with(PlanKind kind, const Predicate& predicate,
                                       const float* query, std::size_t k,
                                       std::size_t ef = 0) const {
-        std::vector<ColumnValue> matched = matching_rows(predicate);
-        return execute(kind, matched, query, k, ef, predicate);
+        if (kind == PlanKind::BitmapFilteredGraph) {
+            return execute(kind, {}, matching_mask(predicate), query, k, ef);
+        }
+        const std::vector<ColumnValue> matched = matching_rows(predicate);
+        return execute(kind, matched, Bitset(), query, k, ef);
+    }
+
+    // Whether a plan can run at all for this predicate. BitmapFilteredGraph
+    // needs a bitmap column whose positions are the corpus's row ids.
+    bool plan_available(PlanKind kind, const Predicate& predicate) const {
+        if (kind != PlanKind::BitmapFilteredGraph) return true;
+        return matching_mask(predicate).size() != 0;
     }
 
     // Row ids satisfying the predicate. The structured half on its own,
@@ -255,16 +294,67 @@ public:
     // row order must sort; the filtered searches do not care, which is why the
     // common path is not made to pay for it.
     std::vector<ColumnValue> matching_rows(const Predicate& predicate) const {
-        const auto it = columns_.find(predicate.column);
-        if (it == columns_.end()) {
-            throw std::invalid_argument(
-                "HybridPlanner: no column named '" + predicate.column +
-                "'. Known columns: " + joined_columns());
+        const ColumnIndex& column = column_for(predicate.column);
+        switch (predicate.op) {
+            case PredOp::Between:
+                return column.query_range(predicate.value, predicate.value2);
+            case PredOp::Prefix:
+                return column.query_prefix(std::get<std::string>(predicate.value));
+            case PredOp::Contains:
+            case PredOp::IsNull:
+                throw std::invalid_argument(
+                    std::string("HybridPlanner: '") + to_string(predicate.op) +
+                    "' cannot be served by an index. Table answers it by "
+                    "scanning; pass the resulting row ids to search_rows().");
+            default:
+                return column.query(compare_op_of(predicate.op), predicate.value);
         }
-        return it->second.range_query(predicate.op, predicate.value);
+    }
+
+    // The rows as a bit set, when the column can produce one aligned to the
+    // vector index's ids. Empty otherwise.
+    Bitset matching_mask(const Predicate& predicate) const {
+        const ColumnIndex& column = column_for(predicate.column);
+        if (!can_mask(column) || !op_is_indexable(predicate.op) ||
+            predicate.op == PredOp::Between || predicate.op == PredOp::Prefix) {
+            return Bitset();
+        }
+        return column.bitmap_for(compare_op_of(predicate.op), predicate.value);
+    }
+
+    // Search a set of row ids the caller already has.
+    //
+    // The seam for everything the planner cannot express: a conjunction
+    // resolved by Table, a Contains that had to be scanned, a hand-built
+    // filter. The plan choice is the same; only the source of the rows differs.
+    std::vector<Neighbor> search_rows(const std::vector<ColumnValue>& rows,
+                                      const float* query, std::size_t k,
+                                      std::size_t ef = 0,
+                                      QueryPlan* out_plan = nullptr) const {
+        QueryPlan plan = plan_for_rows(rows.size(), k);
+        if (out_plan) *out_plan = plan;
+        return execute(plan.kind, rows, Bitset(), query, k, ef);
     }
 
 private:
+    const ColumnIndex& column_for(const std::string& name) const {
+        const auto it = columns_.find(name);
+        if (it == columns_.end()) {
+            throw std::invalid_argument(
+                "HybridPlanner: no column named '" + name +
+                "'. Known columns: " + joined_columns());
+        }
+        return it->second;
+    }
+
+    // A bit set is only usable as a vector filter when position i means row id
+    // i and the set covers the corpus. Both are checkable, and being wrong
+    // would filter on entirely different rows while looking plausible.
+    bool can_mask(const ColumnIndex& column) const {
+        return column.has_bitmap() && column.rows_are_dense() &&
+               column.row_space() == corpus_size();
+    }
+
     std::size_t corpus_size() const {
         if (exact_) return exact_->size();
         if (graph_) return graph_->size();
@@ -280,20 +370,33 @@ private:
         return out.empty() ? "(none)" : out;
     }
 
+    // Everything below the vector work: how many rows match, and how much it
+    // cost to find out.
+    //
+    // A bitmap column aligned to the corpus answers by popcount and keeps the
+    // mask, so nothing is materialised unless a plan turns out to need it.
+    // Every other column has to execute, which is the weakness this file
+    // states at the top and the one case where estimation would have won.
     QueryPlan plan_for(const Predicate& predicate, std::size_t k,
-                       std::vector<ColumnValue>* matched) const {
+                       std::vector<ColumnValue>* matched, Bitset* mask) const {
         QueryPlan plan;
         plan.corpus_rows = corpus_size();
         plan.threshold = threshold_;
 
-        *matched = matching_rows(predicate);
-        plan.matched_rows = matched->size();
+        *mask = matching_mask(predicate);
+        if (mask->size() != 0) {
+            plan.matched_rows = mask->count();
+            plan.selectivity_was_free = true;
+        } else {
+            *matched = matching_rows(predicate);
+            plan.matched_rows = matched->size();
+        }
         plan.selectivity =
             plan.corpus_rows ? static_cast<double>(plan.matched_rows) /
                                static_cast<double>(plan.corpus_rows)
                              : 0.0;
 
-        if (matched->empty()) {
+        if (plan.matched_rows == 0) {
             // Nothing matches, so no vector work is worth doing at all. This
             // is the cheapest possible plan and the structured index alone
             // established it.
@@ -328,6 +431,21 @@ private:
             return plan;
         }
 
+        // The bit set is already the mark array a filtered traversal wants,
+        // so this skips decoding the matches into a vector and stamping every
+        // one of them -- O(matches) of setup per query, before the search
+        // starts. Not a faster membership test: the id-list path already tests
+        // in O(1) against an epoch array.
+        if (mask->size() != 0) {
+            plan.kind = PlanKind::BitmapFilteredGraph;
+            plan.reason = "selectivity " + two_dp(plan.selectivity * 100.0) +
+                          "% is above the " + two_dp(threshold_ * 100.0) +
+                          "% crossover, and the column is a bitmap aligned to "
+                          "the corpus; the graph takes the bit set directly, "
+                          "so no row id is materialised at all";
+            return plan;
+        }
+
         plan.kind = PlanKind::FilteredGraph;
         plan.reason = "selectivity " + two_dp(plan.selectivity * 100.0) +
                       "% is above the " + two_dp(threshold_ * 100.0) +
@@ -336,12 +454,34 @@ private:
         return plan;
     }
 
+    // The same decision for rows a caller already has -- a conjunction Table
+    // resolved, or a predicate no index could serve.
+    QueryPlan plan_for_rows(std::size_t matched, std::size_t k) const {
+        QueryPlan plan;
+        plan.corpus_rows = corpus_size();
+        plan.threshold = threshold_;
+        plan.matched_rows = matched;
+        plan.selectivity = plan.corpus_rows
+                               ? static_cast<double>(matched) /
+                                     static_cast<double>(plan.corpus_rows)
+                               : 0.0;
+        if (matched == 0 || !graph_ || matched <= k ||
+            plan.selectivity <= threshold_) {
+            plan.kind = PlanKind::PreFilter;
+            plan.reason = "selectivity " + two_dp(plan.selectivity * 100.0) +
+                          "% over rows supplied by the caller";
+            return plan;
+        }
+        plan.kind = PlanKind::FilteredGraph;
+        plan.reason = "selectivity " + two_dp(plan.selectivity * 100.0) +
+                      "% over rows supplied by the caller";
+        return plan;
+    }
+
     std::vector<Neighbor> execute(PlanKind kind,
                                   const std::vector<ColumnValue>& matched,
-                                  const float* query, std::size_t k,
-                                  std::size_t ef,
-                                  const Predicate& predicate) const {
-        (void)predicate;
+                                  const Bitset& mask, const float* query,
+                                  std::size_t k, std::size_t ef) const {
         if (k == 0) return {};
 
         switch (kind) {
@@ -366,6 +506,24 @@ private:
                         "graph, which was never attached");
                 }
                 return graph_->search_filtered(query, k, matched, ef);
+            }
+
+            case PlanKind::BitmapFilteredGraph: {
+                if (!graph_) {
+                    throw std::logic_error(
+                        "HybridPlanner: the bitmap-filtered-graph plan needs "
+                        "the graph, which was never attached");
+                }
+                if (mask.size() == 0) {
+                    // Forced by a caller comparing plans on a column that has
+                    // no bit set to give. Saying so beats answering with a
+                    // silently different filter.
+                    throw std::invalid_argument(
+                        "HybridPlanner: this column cannot produce a bit set "
+                        "aligned to the corpus, so the bitmap-filtered-graph "
+                        "plan is not available for it");
+                }
+                return graph_->search_masked(query, k, mask, ef);
             }
 
             case PlanKind::PostFilter: {
