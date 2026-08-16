@@ -48,8 +48,13 @@ from hylis.schema import (  # noqa: F401
 from hylis.storage import Record, RecordStore  # noqa: F401
 from hylis.table import (  # noqa: F401
     ColumnInfo,
+    HybridTrace,
     QueryTrace,
     Table,
+    VectorInfo,
+    VectorMatch,
+    VectorPlan,
+    VectorStructure,
     WriteResult,
     op_is_indexable,
 )

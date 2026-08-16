@@ -37,9 +37,35 @@ def test_demo_runs_clean_and_shows_every_layer():
     assert "answered by popcount" in out                 # the bitmap
     assert "sorted merge over 2 predicates" in out       # conjunctions
     assert "PreFilter" in out and "FilteredGraph" in out  # the planner
+    assert "embeddings attached" in out                  # the vector column
     assert "recovered" in out                            # WAL replay
     assert "replaying the stored plan, not re-measuring it" in out
+    assert "read back from the .fvecs sidecar" in out
     assert "every index agrees with a scan" in out
+
+
+def test_the_demo_shows_the_vector_column_as_part_of_the_table():
+    """Phase E moved the embeddings into the schema. Before it, the demo kept
+    them beside the table and said so; if that ever regresses the walkthrough
+    stops showing the thing the whole project is about."""
+    out = run(["--demo"])
+    assert "the row id is the record key" in out
+    assert "brute force" in out, "the exact arm stopped being shown"
+    assert "recall@" in out
+    # More-like-this, and the reason its own seed is missing from the answer.
+    assert "the seed is excluded" in out
+    # Deletion leaves a hole the graph cannot close, and compaction is what
+    # reclaims it -- both stated, because both are costs a reader should see.
+    assert "orphaned rows" in out
+    assert "a full graph rebuild" in out
+
+
+def test_the_demo_checks_the_vector_half_against_numpy():
+    """`check` grades the exact search against an independent oracle rather
+    than against hylis. Without that the walkthrough would only be asserting
+    that hylis agrees with itself."""
+    out = run(["--demo"])
+    assert "the exact vector search agrees with numpy" in out
 
 
 def test_the_demo_reaches_the_bitmap_plan():
@@ -77,10 +103,13 @@ def test_a_hand_session_survives_a_mixed_workload():
         "explain band lt 3 10",
         "hybrid band lt 3 5",
         "knn 5",
+        "like 7 3",
+        "vectors",
         "put 500 price=1 band=0 category=coats title=new thing in_stock=false"
         " created_at=2026-01-01",
         "get 500",
         "del 501",
+        "compact",
         "check",
         "checkpoint",
         "recover",
@@ -103,7 +132,7 @@ def test_bad_input_is_reported_rather_than_crashing():
         "where price lt abc",      # value that does not parse as int64
         "index nosuch",
         "as price nosuchkind",
-        "explain price lt 1 10",   # no planner copy yet
+        "like 999999 3",           # a record that does not exist
         "quit",
     ]))
     assert "unknown command" in out

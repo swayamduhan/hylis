@@ -35,8 +35,10 @@ using hylis::index::CompareOp;
 using hylis::index::FlatIndex;
 using hylis::index::HnswIndex;
 using hylis::index::Neighbor;
+using hylis::index::Datum;
 using hylis::query::HybridPlanner;
 using hylis::query::PlanKind;
+using hylis::query::PredOp;
 using hylis::query::Predicate;
 using hylis::query::QueryPlan;
 
@@ -51,6 +53,28 @@ const float* as_vector(const FloatArray& arr, const char* what) {
             std::to_string(arr.ndim()) + "-D");
     }
     return arr.data();
+}
+
+Datum datum_from_py(py::handle value) {
+    // bool before int: in Python bool is a subclass of int.
+    if (py::isinstance<py::bool_>(value)) return Datum{value.cast<bool>()};
+    if (py::isinstance<py::int_>(value)) return Datum{value.cast<std::int64_t>()};
+    if (py::isinstance<py::float_>(value)) return Datum{value.cast<double>()};
+    if (py::isinstance<py::str>(value)) return Datum{value.cast<std::string>()};
+    if (value.is_none()) return Datum{};
+    throw std::invalid_argument(
+        "a predicate value must be an int, float, str or bool; got " +
+        std::string(py::str(py::type::of(value))));
+}
+
+Predicate predicate_from_py(const std::string& column, PredOp op,
+                            py::handle value, py::handle value2) {
+    Predicate p;
+    p.column = column;
+    p.op = op;
+    p.value = datum_from_py(value);
+    p.value2 = datum_from_py(value2);
+    return p;
 }
 
 }  // namespace
@@ -91,11 +115,48 @@ PYBIND11_MODULE(_planner, m) {
                "what a system without a planner does, and it can silently\n"
                "return fewer than k rows.");
 
-    // Predicate is bound by hylis._table, which owns query/predicate.hpp's
-    // type. Registering it twice would be a runtime conflict, and the two were
-    // separate structs until phase D unified them -- which is what let the
-    // planner and the table finally appear in one program.
-    py::module_::import("hylis._table");
+    // query/predicate.hpp's types are bound here, not in hylis._table.
+    //
+    // pybind11 allows exactly one owner per C++ type, so the two modules have
+    // to agree on which one registers Predicate -- and the direction is forced
+    // by the layering. table.hpp *includes* planner.hpp, so _table is
+    // downstream and imports _planner; if _planner also imported _table the
+    // two would form an import cycle, and Python's partial-module handling
+    // turns that into "type PlanKind is already registered" at load. Phase E
+    // moved them here for exactly that reason.
+    py::enum_<PredOp>(m, "PredOp", "What a predicate asks of a column.")
+        .value("Eq", PredOp::Eq)
+        .value("Lt", PredOp::Lt)
+        .value("Le", PredOp::Le)
+        .value("Gt", PredOp::Gt)
+        .value("Ge", PredOp::Ge)
+        .value("Between", PredOp::Between, "Inclusive at both ends.")
+        .value("Prefix", PredOp::Prefix,
+               "String columns. One descent and a leaf walk, and impossible\n"
+               "under any integer encoding of the string.")
+        .value("Contains", PredOp::Contains,
+               "String columns. No index here can serve an infix match, so\n"
+               "this is executed by a full scan and the trace says so.")
+        .value("IsNull", PredOp::IsNull,
+               "Rows with no value for the column, which by construction\n"
+               "appear in no index at all.");
+
+    m.def("op_is_indexable", &hylis::query::op_is_indexable, py::arg("op"),
+          "Whether an ordered index can answer this operator directly.");
+
+    py::class_<Predicate>(m, "Predicate", "One structured constraint.")
+        .def(py::init([](std::string column, PredOp op, py::handle value,
+                         py::handle value2) {
+                 return predicate_from_py(std::move(column), op, value, value2);
+             }),
+             py::arg("column"), py::arg("op"), py::arg("value") = py::none(),
+             py::arg("value2") = py::none())
+        .def_readonly("column", &Predicate::column)
+        .def_readonly("op", &Predicate::op)
+        .def("__repr__", [](const Predicate& p) {
+            return "Predicate(" + p.column + " " +
+                   std::string(hylis::query::to_string(p.op)) + ")";
+        });
 
     py::class_<QueryPlan>(m, "QueryPlan",
         "The decision, and the evidence behind it.")

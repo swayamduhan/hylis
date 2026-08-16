@@ -11,6 +11,7 @@
 // LogicalType and the plan types come from `hylis._rmi`, which this module
 // imports at load so registration order is guaranteed.
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -26,18 +27,39 @@ namespace py = pybind11;
 
 using hylis::index::Datum;
 using hylis::index::LogicalType;
+using hylis::index::Metric;
 using hylis::index::Workload;
 using hylis::query::ColumnInfo;
+using hylis::query::HybridTrace;
+using hylis::query::PlanKind;
 using hylis::query::PredOp;
 using hylis::query::Predicate;
 using hylis::query::QueryTrace;
 using hylis::query::Schema;
 using hylis::query::Table;
+using hylis::query::VectorInfo;
+using hylis::query::VectorMatch;
+using hylis::query::VectorPlan;
+using hylis::query::VectorStructure;
 using hylis::query::WriteResult;
 using hylis::storage::Record;
 using hylis::storage::RecordStore;
 
 namespace {
+
+using FloatArray = py::array_t<float, py::array::c_style | py::array::forcecast>;
+
+// A 1-D query vector, as a std::vector so it can go straight into Table's
+// interface. Copied rather than borrowed: the copy is dim floats against a
+// search that touches the whole corpus, and borrowing would need a lifetime
+// story for a numpy array Python may free at any point.
+std::vector<float> query_vector(const FloatArray& arr) {
+    if (arr.ndim() != 1) {
+        throw std::invalid_argument("a query must be a 1-D array, got " +
+                                    std::to_string(arr.ndim()) + "-D");
+    }
+    return std::vector<float>(arr.data(), arr.data() + arr.shape(0));
+}
 
 Datum datum_from_py(py::handle value) {
     // bool before int: in Python bool is a subclass of int.
@@ -93,43 +115,16 @@ PYBIND11_MODULE(_table, m) {
     py::module_::import("hylis._rmi");
     py::module_::import("hylis._schema");
     py::module_::import("hylis._storage");
-
-    py::enum_<PredOp>(m, "PredOp", "What a predicate asks of a column.")
-        .value("Eq", PredOp::Eq)
-        .value("Lt", PredOp::Lt)
-        .value("Le", PredOp::Le)
-        .value("Gt", PredOp::Gt)
-        .value("Ge", PredOp::Ge)
-        .value("Between", PredOp::Between, "Inclusive at both ends.")
-        .value("Prefix", PredOp::Prefix,
-               "String columns. One descent and a leaf walk, and impossible\n"
-               "under any integer encoding of the string.")
-        .value("Contains", PredOp::Contains,
-               "String columns. No index here can serve an infix match, so\n"
-               "this is executed by a full scan and the trace says so.")
-        .value("IsNull", PredOp::IsNull,
-               "Rows with no value for the column, which by construction\n"
-               "appear in no index at all.");
-
-    m.def("op_is_indexable", &hylis::query::op_is_indexable, py::arg("op"),
-          "Whether an ordered index can answer this operator directly.");
-
-    // Bound here rather than in _planner because query/predicate.hpp is the
-    // query layer's shared type: the planner and the table used to have one
-    // Predicate each, which meant they could never appear in the same program.
-    py::class_<Predicate>(m, "Predicate", "One structured constraint.")
-        .def(py::init([](std::string column, PredOp op, py::handle value,
-                         py::handle value2) {
-                 return predicate_from_py(std::move(column), op, value, value2);
-             }),
-             py::arg("column"), py::arg("op"), py::arg("value") = py::none(),
-             py::arg("value2") = py::none())
-        .def_readonly("column", &Predicate::column)
-        .def_readonly("op", &Predicate::op)
-        .def("__repr__", [](const Predicate& p) {
-            return "Predicate(" + p.column + " " +
-                   std::string(hylis::query::to_string(p.op)) + ")";
-        });
+    py::module_::import("hylis._flat");  // Metric
+    // Predicate, PredOp, PlanKind and QueryPlan all live in _planner, and the
+    // direction of that import is not a preference. pybind11 allows one owner
+    // per C++ type, and table.hpp *includes* planner.hpp — so _table is
+    // downstream and imports upstream. Registering Predicate here instead (as
+    // phase D did) makes _planner import _table, and with this module now
+    // needing QueryPlan the two form a cycle: Python hands back a
+    // half-initialised module and pybind11 reports "type PlanKind is already
+    // registered" at import.
+    py::module_::import("hylis._planner");
 
     py::class_<ColumnInfo>(m, "ColumnInfo", "A column, and what indexes it.")
         .def_readonly("name", &ColumnInfo::name)
@@ -179,6 +174,103 @@ PYBIND11_MODULE(_table, m) {
                    ", rebuilds=" + std::to_string(w.rebuilds_triggered) + ")";
         });
 
+    py::enum_<VectorStructure>(m, "VectorStructure",
+        "Which structures a vector column builds.\n\n"
+        "The exact index is present either way. It is the storage -- the\n"
+        "contiguous float buffer everything else is built from -- and it is\n"
+        "the oracle: HNSW is approximate by construction, so recall is the\n"
+        "only question that can be asked of it, and recall is undefined\n"
+        "without a true answer.")
+        .value("Exact", VectorStructure::Exact,
+               "Brute force only: exhaustive, and the answer every\n"
+               "approximate result is graded against.")
+        .value("Graph", VectorStructure::Graph,
+               "HNSW as well, for corpora where scanning everything stops\n"
+               "paying.");
+
+    py::class_<VectorPlan>(m, "VectorPlan",
+        "How a vector column is built.\n\n"
+        "Named rather than measured, unlike every scalar column. choose_index\n"
+        "times lookups; the question for a vector index is recall at a target,\n"
+        "which needs a query workload and a ground truth a table does not\n"
+        "have. The recall measurement stays in scripts/bench_vector.py,\n"
+        "against the exact index this column keeps for exactly that purpose.")
+        .def(py::init([](VectorStructure structure, Metric metric, std::size_t M,
+                         std::size_t ef_construction, std::size_t ef_search,
+                         std::uint64_t seed) {
+                 VectorPlan p;
+                 p.structure = structure;
+                 p.metric = metric;
+                 p.M = M;
+                 p.ef_construction = ef_construction;
+                 p.ef_search = ef_search;
+                 p.seed = seed;
+                 return p;
+             }),
+             py::arg("structure") = VectorStructure::Graph,
+             py::arg("metric") = Metric::L2, py::arg("M") = 16,
+             py::arg("ef_construction") = 200, py::arg("ef_search") = 50,
+             py::arg("seed") = 100)
+        .def_readwrite("structure", &VectorPlan::structure)
+        .def_readwrite("metric", &VectorPlan::metric)
+        .def_readwrite("M", &VectorPlan::M)
+        .def_readwrite("ef_construction", &VectorPlan::ef_construction)
+        .def_readwrite("ef_search", &VectorPlan::ef_search)
+        .def_readwrite("seed", &VectorPlan::seed,
+                       "Fixed, so a rebuild from the same insertion order\n"
+                       "reproduces the graph exactly rather than approximately.\n"
+                       "That is what makes 'reopen returns the same neighbours'\n"
+                       "an assertion instead of a hope.")
+        .def("__repr__", [](const VectorPlan& p) {
+            return std::string("VectorPlan(") +
+                   hylis::query::to_string(p.structure) + ", " +
+                   hylis::index::to_string(p.metric) +
+                   ", M=" + std::to_string(p.M) + ")";
+        });
+
+    py::class_<VectorMatch>(m, "VectorMatch", "One neighbour, in the table's terms.")
+        .def_readonly("key", &VectorMatch::key, "The record key.")
+        .def_readonly("row", &VectorMatch::row,
+                      "Its position inside the vector index. Kept because it is\n"
+                      "what a second vector call wants, and because comparing\n"
+                      "two plans should not need a round trip through the store.")
+        .def_readonly("score", &VectorMatch::score,
+                      "Whatever the column's metric measures: a distance for\n"
+                      "L2, a dot product for InnerProduct, a cosine similarity\n"
+                      "for Cosine. Best first regardless of which.")
+        .def("__repr__", [](const VectorMatch& m) {
+            return "VectorMatch(key=" + std::to_string(m.key) +
+                   ", score=" + std::to_string(m.score) + ")";
+        });
+
+    py::class_<VectorInfo>(m, "VectorInfo", "A vector column, and what it holds.")
+        .def_readonly("name", &VectorInfo::name)
+        .def_readonly("dim", &VectorInfo::dim)
+        .def_readonly("indexed", &VectorInfo::indexed)
+        .def_readonly("rows", &VectorInfo::rows, "Rows with a live embedding.")
+        .def_readonly("orphans", &VectorInfo::orphans,
+                      "Rows deletion could not reclaim. HNSW cannot give a node\n"
+                      "back, so a delete is a mask rather than a removal; the\n"
+                      "space returns at the next compaction. Visible because it\n"
+                      "costs twice: memory, and every search taking the masked\n"
+                      "path.")
+        .def_readonly("structure", &VectorInfo::structure)
+        .def_readonly("metric", &VectorInfo::metric)
+        .def_readonly("has_graph", &VectorInfo::has_graph)
+        .def_readonly("rows_are_keys", &VectorInfo::rows_are_keys,
+                      "Whether row id i is record key i. The precondition for\n"
+                      "using a table bitmap as a vector mask: bit position i\n"
+                      "has to mean the same row in both.")
+        .def_readonly("memory_bytes", &VectorInfo::memory_bytes,
+                      "Including *both* copies of the corpus when a graph is\n"
+                      "built. The exact index keeps its own, which is the price\n"
+                      "of brute force staying independently searchable.")
+        .def("__repr__", [](const VectorInfo& v) {
+            return "VectorInfo('" + v.name + "', dim=" + std::to_string(v.dim) +
+                   ", rows=" + std::to_string(v.rows) +
+                   ", orphans=" + std::to_string(v.orphans) + ")";
+        });
+
     py::class_<QueryTrace>(m, "QueryTrace", "Why a query executed as it did.")
         .def_readonly("reason", &QueryTrace::reason)
         .def_readonly("used_index", &QueryTrace::used_index)
@@ -189,6 +281,25 @@ PYBIND11_MODULE(_table, m) {
         .def("__repr__", [](const QueryTrace& t) {
             return "QueryTrace(" + std::string(t.used_index ? "index" : "scan") +
                    ", matched=" + std::to_string(t.matched) + ")";
+        });
+
+    py::class_<HybridTrace>(m, "HybridTrace",
+        "What a hybrid query did: the structured half, the plan, and the join.")
+        .def_readonly("structured", &HybridTrace::structured,
+                      "How the predicates were resolved.")
+        .def_readonly("plan", &HybridTrace::plan, "What the planner chose, and why.")
+        .def_readonly("without_vector", &HybridTrace::without_vector,
+                      "Rows the predicate matched that carry no embedding.\n"
+                      "Dropped, because a row with no vector cannot be a\n"
+                      "nearest neighbour -- and counted, because returning\n"
+                      "fewer rows than the predicate matched must not be silent.")
+        .def_readonly("mask_used", &HybridTrace::mask_used,
+                      "Whether the structured half was answered by a popcount,\n"
+                      "so no row id was materialised before the search began.")
+        .def("__repr__", [](const HybridTrace& t) {
+            return std::string("HybridTrace(") +
+                   hylis::query::to_string(t.plan.kind) +
+                   ", matched=" + std::to_string(t.plan.matched_rows) + ")";
         });
 
     py::class_<Table>(m, "Table",
@@ -322,11 +433,168 @@ PYBIND11_MODULE(_table, m) {
            "Record keys matching any predicate, ascending and deduplicated.")
         .def("scan", &Table::scan, py::arg("limit") = 0, py::arg("offset") = 0)
 
+        // --- vectors ---
+        .def("create_vector_index", &Table::create_vector_index,
+             py::arg("column"), py::arg("plan") = VectorPlan{},
+             "Build (or re-tune) the structures behind a vector column.\n\n"
+             "Re-tuning keeps every embedding, except that the metric cannot\n"
+             "change on a non-empty column: Cosine stores the normalised form,\n"
+             "so the vectors handed in are no longer recoverable.")
+        .def("drop_vector_index", &Table::drop_vector_index, py::arg("column"))
+        .def("has_vector_index", &Table::has_vector_index, py::arg("column"))
+        .def("describe_vectors", &Table::describe_vectors)
+        .def("vector_info", &Table::vector_info, py::arg("column"))
+        .def("put_vector", [](Table& self, std::int64_t key,
+                              const std::string& column, const FloatArray& vec) {
+            return self.put_vector(key, column, query_vector(vec));
+        }, py::arg("key"), py::arg("column"), py::arg("vector"),
+           "Attach an embedding to a record, returning the row it occupies.\n\n"
+           "The record must already exist: an embedding belongs to a row, and\n"
+           "knn() answers in record keys the caller is going to fetch.\n\n"
+           "**Not write-ahead logged.** The floats reach disk at\n"
+           "save_vectors() and nowhere else, so a crash before that loses\n"
+           "every embedding attached since the last one while the records\n"
+           "themselves survive. That is the cost of keeping a 128-float vector\n"
+           "out of a JSON WAL.")
+        .def("put_vectors", [](Table& self, const std::string& column,
+                               const std::vector<std::int64_t>& keys,
+                               const FloatArray& data) {
+            if (data.ndim() != 2) {
+                throw std::invalid_argument(
+                    "put_vectors: expected an (n, dim) array, got " +
+                    std::to_string(data.ndim()) + "-D");
+            }
+            if (static_cast<std::size_t>(data.shape(0)) != keys.size()) {
+                throw std::invalid_argument(
+                    "put_vectors: " + std::to_string(keys.size()) + " keys but " +
+                    std::to_string(data.shape(0)) + " rows of vectors");
+            }
+            const std::vector<float> flat(
+                data.data(), data.data() + data.shape(0) * data.shape(1));
+            return self.put_vectors(column, keys, flat);
+        }, py::arg("column"), py::arg("keys"), py::arg("vectors"),
+           "Attach many embeddings at once, keys against an (n, dim) array.")
+        .def("erase_vector", &Table::erase_vector, py::arg("key"), py::arg("column"))
+        .def("has_vector", &Table::has_vector, py::arg("key"), py::arg("column"))
+        .def("get_vector", [](const Table& self, std::int64_t key,
+                              const std::string& column) -> py::object {
+            const std::vector<float> v = self.get_vector(key, column);
+            if (v.empty()) return py::none();
+            return py::array_t<float>(static_cast<py::ssize_t>(v.size()), v.data());
+        }, py::arg("key"), py::arg("column"),
+           "The stored embedding, or None. For Cosine this is the normalised\n"
+           "form, which is what the index compares against.")
+        .def("vector_keys", &Table::vector_keys, py::arg("column"),
+             "Every record key carrying an embedding, in row order.")
+        .def("compact_vectors", &Table::compact_vectors, py::arg("column"),
+             "Reclaim the rows deletion could not, and stop every search\n"
+             "paying the masked path for them. Returns how many were freed.")
+
+        .def("knn", [](const Table& self, const std::string& column,
+                       const FloatArray& query, std::size_t k, std::size_t ef,
+                       bool exact) {
+            return self.knn(column, query_vector(query), k, ef, exact);
+        }, py::arg("column"), py::arg("query"), py::arg("k") = 10,
+           py::arg("ef") = 0, py::arg("exact") = false,
+           "k nearest, best first, in record keys.\n\n"
+           "`exact` forces the brute-force scan. Selectable rather than a\n"
+           "fallback: it is the only exact answer here, and it is what every\n"
+           "approximate result is graded against.")
+        .def("knn_by_key", [](const Table& self, const std::string& column,
+                              std::int64_t key, std::size_t k, std::size_t ef,
+                              bool exact) {
+            return self.knn_by_key(column, key, k, ef, exact);
+        }, py::arg("column"), py::arg("key"), py::arg("k") = 10,
+           py::arg("ef") = 0, py::arg("exact") = false,
+           "More-like-this, seeded by a row already in the table.\n\n"
+           "The seed is excluded: a row is always its own nearest neighbour,\n"
+           "so returning it would spend one of the k on something the caller\n"
+           "already has.")
+        .def("hybrid", [](const Table& self, const py::list& predicates,
+                          const std::string& column, const FloatArray& query,
+                          std::size_t k, std::size_t ef) {
+            HybridTrace trace;
+            auto matches = self.hybrid(predicates_from_py(predicates), column,
+                                       query_vector(query), k, ef, &trace);
+            return py::make_tuple(std::move(matches), trace);
+        }, py::arg("predicates"), py::arg("column"), py::arg("query"),
+           py::arg("k") = 10, py::arg("ef") = 0,
+           "k nearest among rows satisfying the predicates, with the trace.\n\n"
+           "Every plan returns the same rows; the planner chooses between\n"
+           "costs, never between answers. When every predicate is served by a\n"
+           "bitmap column whose positions are this column's row ids, the\n"
+           "structured half is a popcount and no row id is materialised at\n"
+           "all; otherwise the predicates resolve to record keys which are\n"
+           "then translated to rows.")
+        .def("hybrid_with", [](const Table& self, PlanKind kind,
+                               const py::list& predicates,
+                               const std::string& column, const FloatArray& query,
+                               std::size_t k, std::size_t ef) {
+            HybridTrace trace;
+            auto matches = self.hybrid_with(kind, predicates_from_py(predicates),
+                                            column, query_vector(query), k, ef,
+                                            &trace);
+            return py::make_tuple(std::move(matches), trace);
+        }, py::arg("plan"), py::arg("predicates"), py::arg("column"),
+           py::arg("query"), py::arg("k") = 10, py::arg("ef") = 0,
+           "Force a plan. Exists so a test can assert every legal plan returns\n"
+           "the same rows -- without it the planner could pick a fast *wrong*\n"
+           "plan and nothing would notice.")
+        .def("explain_hybrid", [](const Table& self, const py::list& predicates,
+                                  const std::string& column, std::size_t k) {
+            return self.explain_hybrid(predicates_from_py(predicates), column, k);
+        }, py::arg("predicates"), py::arg("column"), py::arg("k") = 10,
+           "Decide, without doing any vector work.\n\n"
+           "On a bitmap column aligned to the vector rows this costs a\n"
+           "popcount; on any other it costs the whole structured query,\n"
+           "because executing the predicate is how this planner knows its\n"
+           "selectivity. The trace says which one happened.")
+        .def("calibrate", [](Table& self, const std::string& column,
+                             const FloatArray& queries, std::size_t k,
+                             std::size_t ef, std::size_t samples) {
+            if (queries.ndim() != 2) {
+                throw std::invalid_argument(
+                    "calibrate: expected an (n, dim) array of queries, got " +
+                    std::to_string(queries.ndim()) + "-D");
+            }
+            const std::vector<float> flat(
+                queries.data(), queries.data() + queries.shape(0) * queries.shape(1));
+            return self.calibrate(column, flat, k, ef, samples);
+        }, py::arg("column"), py::arg("queries"), py::arg("k") = 10,
+           py::arg("ef") = 0, py::arg("samples") = 12,
+           "Measure this corpus's own pre-filter crossover and adopt it.\n\n"
+           "The 50% default came from one measurement on one corpus at one ef,\n"
+           "and the crossover is not a constant of the algorithm: it moves with\n"
+           "n, with the dimensionality, with ef, and with how fast this\n"
+           "machine's cache is. No scalar column is involved -- the synthetic\n"
+           "filters are cut from the vector column's own rows.")
+        .def("plan_available", [](const Table& self, PlanKind kind,
+                                  const py::list& predicates,
+                                  const std::string& column) {
+            return self.plan_available(kind, predicates_from_py(predicates), column);
+        }, py::arg("plan"), py::arg("predicates"), py::arg("column"))
+        .def_property("prefilter_threshold", &Table::prefilter_threshold,
+                      &Table::set_prefilter_threshold,
+                      "Selectivity at or below which a filtered exhaustive scan\n"
+                      "is preferred. A single measured constant, and that is the\n"
+                      "point: it is the honest baseline a learned cost model has\n"
+                      "to beat.")
+
         // --- persistence ---
-        .def("save", &Table::save, "Write the schema and the catalog, atomically.")
+        .def("save", &Table::save,
+             "Write the schema, the vectors and the catalog, atomically.")
+        .def("save_vectors", &Table::save_vectors,
+             "Write the embeddings and the metadata that interprets them.\n\n"
+             "Separate from save() because it is the one durability point\n"
+             "vectors have: they never reach the write-ahead log. What lands\n"
+             "on disk is the compacted form -- live rows only -- whether or\n"
+             "not memory has caught up, so a reopen is always clean.")
         .def("checkpoint", &Table::checkpoint,
-             "Flush pending rebuilds, snapshot the store, truncate the WAL,\n"
-             "and save the schema and catalog.")
+             "Flush pending rebuilds, write every derived file, then snapshot\n"
+             "the store and truncate the WAL.\n\n"
+             "The derived files go first, which is the reverse of the obvious\n"
+             "order and is deliberate: the snapshot truncates the log, and the\n"
+             "embeddings are the one thing here with no log to replay from.")
         .def("freshness", &Table::freshness, py::arg("column"))
         .def("rebuild", &Table::rebuild, py::arg("column"))
         .def("rebuilds", &Table::rebuilds,

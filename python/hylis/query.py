@@ -22,17 +22,22 @@ Every plan returns the same rows: the planner chooses between *costs*, never
 between *answers*.
 """
 
+# ``Predicate`` is here too, not in ``hylis._table``. ``query/predicate.hpp``
+# is the query layer's shared type -- the planner and the table used to define
+# one each, which meant they could never appear in the same program, and a demo
+# of the whole system has to do exactly that.
+#
+# It is bound by ``_planner`` rather than ``_table`` because pybind11 allows one
+# owner per C++ type and ``table.hpp`` includes ``planner.hpp``: downstream
+# imports upstream. The other direction makes the two extension modules a cycle.
 from hylis._planner import (  # noqa: F401
     HybridPlanner,
     PlanKind,
+    PredOp,
+    Predicate,
     QueryPlan,
+    op_is_indexable,
 )
-
-# Predicate lives in hylis._table: query/predicate.hpp is the query layer's
-# shared type. The planner and the table used to define one each, which meant
-# they could never appear in the same program -- and a demo of the whole system
-# has to do exactly that.
-from hylis._table import PredOp, Predicate  # noqa: F401
 
 
 import numpy as np

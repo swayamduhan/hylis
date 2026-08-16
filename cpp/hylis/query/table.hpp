@@ -18,10 +18,16 @@
 //
 // Row identity
 // ------------
-// The record's primary key *is* the row id. Secondary indexes map
+// The record's primary key *is* the row id, for every scalar index. They map
 // (column value) -> record key, so a predicate's answer is directly a set of
 // keys the store can fetch. No separate row numbering, and therefore nothing
-// to renumber. (Vector columns do need dense row ids, and that is phase E.)
+// to renumber.
+//
+// Vector columns cannot work that way: their ids are dense positions into a
+// float buffer, because the buffer is what makes a sequential sweep fast. So a
+// vector column carries its own key <-> row translation, and a hybrid query is
+// the place the two spaces meet — see query/vector_column.hpp, which owns that
+// join and states what it costs.
 //
 // The write path
 // --------------
@@ -70,8 +76,10 @@
 #include "index/column_index.hpp"
 #include "index/index_catalog.hpp"
 #include "index/logical_type.hpp"
+#include "query/planner.hpp"
 #include "query/predicate.hpp"
 #include "query/schema.hpp"
+#include "query/vector_column.hpp"
 #include "storage/detail.hpp"
 #include "storage/record.hpp"
 #include "storage/store.hpp"
@@ -86,6 +94,7 @@ using hylis::index::IndexKind;
 using hylis::index::IndexPlan;
 using hylis::index::KeyEncoding;
 using hylis::index::LogicalType;
+using hylis::index::Metric;
 using hylis::index::Workload;
 
 // A column, its index, and how the index came to exist.
@@ -112,6 +121,27 @@ struct ColumnInfo {
     double ns_per_lookup = 0.0;
 };
 
+// A vector column, and what it currently holds.
+struct VectorInfo {
+    std::string name;
+    std::size_t dim = 0;
+    bool indexed = false;
+
+    // Rows with a live embedding, and rows deletion could not reclaim. The
+    // second is the visible price of HNSW having no delete: it is space, and
+    // it is every search running through the masked path.
+    std::size_t rows = 0;
+    std::size_t orphans = 0;
+
+    VectorStructure structure = VectorStructure::Exact;
+    Metric metric = Metric::L2;
+    bool has_graph = false;
+    // Whether row id i is record key i, which is what makes a table bitmap
+    // usable as a vector mask.
+    bool rows_are_keys = false;
+    std::size_t memory_bytes = 0;
+};
+
 // What a write cost, so the expensive paths are visible rather than silent.
 struct WriteResult {
     // True when the record was new rather than an update. For a batch, see
@@ -134,10 +164,25 @@ struct QueryTrace {
     std::size_t matched = 0;
 };
 
+// What a hybrid query did, beyond the plan itself.
+struct HybridTrace {
+    QueryTrace structured;
+    QueryPlan plan;
+    // Rows the predicate matched that carry no embedding. Dropped, because a
+    // row with no vector cannot be a nearest neighbour — and counted, because
+    // returning fewer rows than the predicate matched is exactly the kind of
+    // thing that must not be silent.
+    std::size_t without_vector = 0;
+    // Whether the structured half was answered by a popcount, so no row id was
+    // materialised before the vector search began.
+    bool mask_used = false;
+};
+
 class Table {
 public:
     static constexpr const char* CATALOG_NAME = "catalog.json";
     static constexpr const char* SCHEMA_NAME = "schema.json";
+    static constexpr const char* VECTORS_NAME = "vectors.json";
 
     // The store is borrowed and must outlive the table. It is the system of
     // record; everything here is derived from it and can be rebuilt from it.
@@ -148,6 +193,7 @@ public:
             reconcile(Schema::parse_json(stored_schema));
         }
         catalog_ = IndexCatalog::load(path_of(CATALOG_NAME));
+        load_vectors();
     }
 
     // Move-only, and said explicitly rather than left implicit.
@@ -266,7 +312,368 @@ public:
         return it->second.index->plan();
     }
 
+    // --- vector DDL ---------------------------------------------------------
+
+    // Build (or re-tune) the structures behind a vector column.
+    //
+    // Not chosen by measurement, unlike every scalar column, and the asymmetry
+    // is deliberate: choose_index times lookups, while the question for a
+    // vector index is recall at a target — which needs a query workload and a
+    // ground truth a table does not have. Naming the structure is the honest
+    // interface; the recall measurement stays in scripts/bench_vector.py,
+    // against the exact index this column keeps for exactly that purpose.
+    VectorInfo create_vector_index(const std::string& name,
+                                   VectorPlan plan = VectorPlan{}) {
+        const ColumnDef& def = schema_.column(name);
+        if (def.type != LogicalType::Vector) {
+            throw std::invalid_argument(
+                "Table: column '" + name + "' is " +
+                index::to_string(def.type) +
+                ", not a vector. Scalar columns are served by create_index().");
+        }
+        const auto it = vectors_.find(name);
+        if (it == vectors_.end()) {
+            vectors_.emplace(name, VectorColumn(name, def.dim, plan));
+        } else {
+            // Keeps the embeddings: re-tuning M or ef_construction is a
+            // legitimate operation, and losing the corpus to perform it would
+            // make it unusable on any table that already holds one.
+            it->second.retune(plan);
+        }
+        return vector_info_of(name, def, &vectors_.at(name));
+    }
+
+    bool drop_vector_index(const std::string& name) {
+        return vectors_.erase(name) > 0;
+    }
+
+    bool has_vector_index(const std::string& name) const {
+        return vectors_.find(name) != vectors_.end();
+    }
+
+    const VectorColumn& vector_column(const std::string& name) const {
+        return *require_vector(name);
+    }
+
+    std::vector<VectorInfo> describe_vectors() const {
+        std::vector<VectorInfo> out;
+        for (const ColumnDef& def : schema_.columns()) {
+            if (def.type != LogicalType::Vector) continue;
+            const auto it = vectors_.find(def.name);
+            out.push_back(vector_info_of(
+                def.name, def, it == vectors_.end() ? nullptr : &it->second));
+        }
+        return out;
+    }
+
+    VectorInfo vector_info(const std::string& name) const {
+        const ColumnDef& def = schema_.column(name);
+        const auto it = vectors_.find(name);
+        return vector_info_of(name, def,
+                              it == vectors_.end() ? nullptr : &it->second);
+    }
+
     // --- DML ----------------------------------------------------------------
+
+    // Attach an embedding to a record. Returns the row it occupies.
+    //
+    // The record must already exist. A vector whose record does not is a row
+    // no query can ever return — knn() answers in record keys, and the caller's
+    // next move is to fetch them — so accepting one would only defer the
+    // failure to a point where it is much harder to attribute.
+    //
+    // **Not write-ahead logged.** The floats go to the vector index and to
+    // nothing else until save_vectors(); a crash before that loses every
+    // embedding attached since the last one, while the records themselves
+    // survive. That is the cost of keeping a 128-float vector out of a JSON
+    // WAL, it is stated here rather than discovered, and save_vectors() is the
+    // durability point a caller can take without a full checkpoint.
+    std::int64_t put_vector(std::int64_t key, const std::string& column,
+                            const std::vector<float>& vector) {
+        VectorColumn* vec = require_vector(column);
+        if (store_->get(key) == nullptr) {
+            throw std::invalid_argument(
+                "Table::put_vector: no record with key " + std::to_string(key) +
+                ". An embedding belongs to a row; put() the record first.");
+        }
+        return vec->put(key, vector);
+    }
+
+    // Attach many at once. `data` is row-major, dim floats per key.
+    std::size_t put_vectors(const std::string& column,
+                            const std::vector<std::int64_t>& keys,
+                            const std::vector<float>& data) {
+        VectorColumn* vec = require_vector(column);
+        if (keys.size() * vec->dim() != data.size()) {
+            throw std::invalid_argument(
+                "Table::put_vectors: " + std::to_string(keys.size()) +
+                " keys against " + std::to_string(data.size()) +
+                " floats at " + std::to_string(vec->dim()) + " dimensions");
+        }
+        for (std::int64_t key : keys) {
+            if (store_->get(key) == nullptr) {
+                throw std::invalid_argument(
+                    "Table::put_vectors: no record with key " +
+                    std::to_string(key));
+            }
+        }
+        for (std::size_t i = 0; i < keys.size(); ++i) {
+            vec->put(keys[i], data.data() + i * vec->dim());
+        }
+        return keys.size();
+    }
+
+    bool erase_vector(std::int64_t key, const std::string& column) {
+        return require_vector(column)->erase(key);
+    }
+
+    bool has_vector(std::int64_t key, const std::string& column) const {
+        return require_vector(column)->contains(key);
+    }
+
+    // The stored embedding, or an empty vector when the row has none. For
+    // Cosine this is the normalised form, which is what the index compares
+    // against and therefore what a caller reasoning about a score needs.
+    std::vector<float> get_vector(std::int64_t key,
+                                  const std::string& column) const {
+        const VectorColumn* vec = require_vector(column);
+        const float* v = vec->vector_of(key);
+        if (v == nullptr) return {};
+        return std::vector<float>(v, v + vec->dim());
+    }
+
+    // Every record key carrying an embedding, in row order.
+    std::vector<std::int64_t> vector_keys(const std::string& column) const {
+        return require_vector(column)->keys();
+    }
+
+    // --- vector queries -----------------------------------------------------
+
+    // k nearest, best first, in record keys.
+    //
+    // `exact` forces the brute-force scan. Selectable rather than a fallback:
+    // it is the only exact answer here, and it is what every approximate
+    // result is graded against.
+    std::vector<VectorMatch> knn(const std::string& column,
+                                 const std::vector<float>& query,
+                                 std::size_t k, std::size_t ef = 0,
+                                 bool exact = false) const {
+        return require_vector(column)->knn(query.data(), k, ef, exact);
+    }
+
+    // More-like-this, seeded by a row already in the table. The seed is
+    // excluded: a row is always its own nearest neighbour, so returning it
+    // would spend one of the k on something the caller already has.
+    std::vector<VectorMatch> knn_by_key(const std::string& column,
+                                        std::int64_t key, std::size_t k,
+                                        std::size_t ef = 0,
+                                        bool exact = false) const {
+        return require_vector(column)->knn_by_key(key, k, ef, exact);
+    }
+
+    // The query the whole project is for: k nearest **among rows satisfying
+    // the predicates**.
+    //
+    // Every plan returns the same rows; the planner chooses between costs,
+    // never between answers. Two routes in:
+    //
+    //   * when every predicate is served by a bitmap column whose positions
+    //     are this vector column's row ids, the structured half is a
+    //     word-parallel AND and a popcount, and **no row id is materialised at
+    //     all** before the search starts;
+    //   * otherwise the predicates resolve to record keys, which are then
+    //     translated to rows — the one place the two id spaces meet, and the
+    //     cost the key/row split buys back in exchange for not renumbering
+    //     anything on a scalar write.
+    //
+    // The planner is built here and thrown away, holding only the two vector
+    // indexes. It deliberately gets no columns: Table already owns them, and
+    // HybridPlanner::set_column copies, so attaching them would keep a second
+    // copy of every index alive for the lifetime of the table.
+    std::vector<VectorMatch> hybrid(const std::vector<Predicate>& predicates,
+                                    const std::string& column,
+                                    const std::vector<float>& query,
+                                    std::size_t k, std::size_t ef = 0,
+                                    HybridTrace* out = nullptr) const {
+        const VectorColumn* vec = require_vector(column);
+        HybridTrace trace;
+
+        if (predicates.empty()) {
+            // No structured half at all, so this degenerates to a similarity
+            // search and the plan says so rather than inventing a filter.
+            trace.plan.kind = PlanKind::NoPredicate;
+            trace.plan.corpus_rows = vec->size();
+            trace.plan.matched_rows = vec->size();
+            trace.plan.selectivity = 1.0;
+            trace.plan.reason = "no predicate; an unconstrained similarity search";
+            trace.structured.reason = trace.plan.reason;
+            if (out) *out = trace;
+            return vec->knn(query.data(), k, ef);
+        }
+
+        const HybridPlanner planner = planner_for(*vec);
+
+        Bitset mask;
+        if (vector_mask(predicates, *vec, &mask, &trace.structured)) {
+            trace.mask_used = true;
+            std::vector<Neighbor> raw =
+                planner.search_mask(mask, query.data(), k, ef, &trace.plan);
+            trace.structured.matched = trace.plan.matched_rows;
+            if (out) *out = trace;
+            return vec->present(raw);
+        }
+
+        const std::vector<std::int64_t> keys =
+            select_all(predicates, &trace.structured);
+        const std::vector<ColumnValue> rows =
+            vec->rows_for(keys, &trace.without_vector);
+        std::vector<Neighbor> raw =
+            planner.search_rows(rows, query.data(), k, ef, &trace.plan);
+        if (out) *out = trace;
+        return vec->present(raw);
+    }
+
+    // Decide, without doing any vector work.
+    //
+    // The command a demo runs to show the planner reasoning, and the thing E5
+    // measured: on a bitmap column aligned to the vector rows this costs a
+    // popcount, while on any other column it costs the whole structured query,
+    // because executing the predicate *is* how this planner knows its
+    // selectivity. That asymmetry is the point, and it is why the trace says
+    // which one happened.
+    HybridTrace explain_hybrid(const std::vector<Predicate>& predicates,
+                               const std::string& column, std::size_t k) const {
+        const VectorColumn* vec = require_vector(column);
+        HybridTrace trace;
+        const HybridPlanner planner = planner_for(*vec);
+
+        if (predicates.empty()) {
+            trace.plan.kind = PlanKind::NoPredicate;
+            trace.plan.corpus_rows = vec->size();
+            trace.plan.matched_rows = vec->size();
+            trace.plan.selectivity = 1.0;
+            trace.plan.reason = "no predicate; an unconstrained similarity search";
+            return trace;
+        }
+
+        Bitset mask;
+        if (vector_mask(predicates, *vec, &mask, &trace.structured)) {
+            trace.mask_used = true;
+            trace.plan = planner.explain_rows(mask.count(), k, true);
+            trace.plan.selectivity_was_free = true;
+            trace.structured.matched = trace.plan.matched_rows;
+            return trace;
+        }
+
+        const std::vector<std::int64_t> keys =
+            select_all(predicates, &trace.structured);
+        const std::vector<ColumnValue> rows =
+            vec->rows_for(keys, &trace.without_vector);
+        trace.plan = planner.explain_rows(rows.size(), k, false);
+        return trace;
+    }
+
+    // Measure this corpus's own pre-filter crossover and adopt it.
+    //
+    // The 50% default came from one measurement on one corpus at one ef, and
+    // the crossover is not a constant of the algorithm: it moves with n, with
+    // the dimensionality, with ef, and with how fast this machine's cache is.
+    // Same answer choose_index() gives one level down — build both, time both,
+    // keep what won.
+    //
+    // `queries` is row-major, dim floats each. No scalar column is involved:
+    // the synthetic filters are cut from the vector column's own rows, so the
+    // crossover measured is a property of the corpus and the machine rather
+    // than of whichever attribute happened to be indexed.
+    double calibrate(const std::string& column,
+                     const std::vector<float>& queries, std::size_t k = 10,
+                     std::size_t ef = 0, std::size_t samples = 12) {
+        const VectorColumn* vec = require_vector(column);
+        if (vec->dim() == 0 || queries.size() % vec->dim() != 0) {
+            throw std::invalid_argument(
+                "Table::calibrate: " + std::to_string(queries.size()) +
+                " floats is not a whole number of " +
+                std::to_string(vec->dim()) + "-dimensional queries");
+        }
+        HybridPlanner planner = planner_for(*vec);
+        if (!vec->has_graph()) return prefilter_threshold_;
+
+        std::vector<ColumnValue> rows;
+        rows.reserve(vec->size());
+        vec->live().for_each([&](std::size_t row) {
+            rows.push_back(static_cast<ColumnValue>(row));
+        });
+
+        prefilter_threshold_ = planner.calibrate_rows(
+            rows, queries.data(), queries.size() / vec->dim(), k, ef, samples);
+        return prefilter_threshold_;
+    }
+
+    // Force a plan. Exists so a test can assert that every legal plan returns
+    // the same rows — without it the planner could pick a fast *wrong* plan and
+    // nothing would notice, which is the one failure mode a query optimiser
+    // must not have.
+    std::vector<VectorMatch> hybrid_with(PlanKind kind,
+                                         const std::vector<Predicate>& predicates,
+                                         const std::string& column,
+                                         const std::vector<float>& query,
+                                         std::size_t k, std::size_t ef = 0,
+                                         HybridTrace* out = nullptr) const {
+        const VectorColumn* vec = require_vector(column);
+        HybridTrace trace;
+        trace.plan.kind = kind;
+
+        const std::vector<std::int64_t> keys =
+            select_all(predicates, &trace.structured);
+        const std::vector<ColumnValue> rows =
+            vec->rows_for(keys, &trace.without_vector);
+        trace.plan.corpus_rows = vec->rows();
+        trace.plan.matched_rows = rows.size();
+        trace.plan.reason = std::string("forced: ") + to_string(kind);
+
+        Bitset mask;
+        if (kind == PlanKind::BitmapFilteredGraph) {
+            QueryTrace ignored;
+            if (!vector_mask(predicates, *vec, &mask, &ignored)) {
+                throw std::invalid_argument(
+                    "Table::hybrid_with: the bitmap-filtered-graph plan needs "
+                    "every predicate served by a bitmap column whose positions "
+                    "are '" + column + "'s row ids; " + why_no_mask(predicates, *vec));
+            }
+            trace.mask_used = true;
+        }
+
+        const HybridPlanner planner = planner_for(*vec);
+        std::vector<Neighbor> raw =
+            planner.execute_plan(kind, rows, mask, query.data(), k, ef);
+        if (out) *out = trace;
+        return vec->present(raw);
+    }
+
+    // Whether a plan can run at all for these predicates over this column.
+    bool plan_available(PlanKind kind, const std::vector<Predicate>& predicates,
+                        const std::string& column) const {
+        const VectorColumn* vec = require_vector(column);
+        if (kind == PlanKind::BitmapFilteredGraph) {
+            Bitset mask;
+            QueryTrace ignored;
+            return vector_mask(predicates, *vec, &mask, &ignored);
+        }
+        if (kind == PlanKind::NoPredicate) return true;
+        return kind == PlanKind::PreFilter || vec->has_graph();
+    }
+
+    // The selectivity at or below which a filtered exhaustive scan is
+    // preferred. A single measured constant, and that is the point: it is the
+    // honest baseline a learned cost model has to beat.
+    double prefilter_threshold() const { return prefilter_threshold_; }
+    void set_prefilter_threshold(double t) { prefilter_threshold_ = t; }
+
+    // Reclaim the rows deletion could not, and stop every search paying the
+    // masked path for them.
+    std::size_t compact_vectors(const std::string& column) {
+        return require_vector(column)->compact();
+    }
 
     // Insert or update one record. Type-checked against the schema *before*
     // anything is written, so a record that would half-load is refused.
@@ -326,6 +733,12 @@ public:
             const auto it = before.columns.find(name);
             if (it == before.columns.end()) continue;
             remove_entry(name, column, it->second, key, &result);
+        }
+        // The embedding goes with the row. Exact and immediate as far as every
+        // query is concerned; the *space* comes back at the next compaction,
+        // because HNSW cannot give a node back (see vector_column.hpp).
+        for (auto& [name, vec] : vectors_) {
+            if (vec.erase(key)) ++result.indexes_touched;
         }
         return result;
     }
@@ -492,20 +905,55 @@ public:
 
     // --- persistence --------------------------------------------------------
 
-    // Both files, atomically. The schema first: a catalog naming an encoding
-    // for a column whose type is unknown cannot be interpreted, so the reverse
-    // order would leave a readable catalog and an unreadable meaning.
+    // Every derived file, atomically. The schema first: a catalog naming an
+    // encoding for a column whose type is unknown cannot be interpreted, and
+    // neither can a sidecar of raw floats, so the reverse order would leave
+    // both readable and neither meaningful.
     void save() const {
         storage::detail::atomic_write(path_of(SCHEMA_NAME),
                                       path_of(SCHEMA_NAME) + ".tmp",
                                       schema_.serialize());
+        save_vectors();
         catalog_.save(path_of(CATALOG_NAME));
     }
 
+    // The embeddings, and the metadata without which they are just floats.
+    //
+    // Separated from save() because it is the one durability point vectors
+    // have: they never reach the write-ahead log, so a caller who wants them
+    // safe without paying for a full store snapshot takes this.
+    //
+    // What lands on disk is the *compacted* form — live rows only, renumbered
+    // — whether or not memory has caught up, so a reopen is always clean even
+    // if compact_vectors() was never called.
+    void save_vectors() const {
+        if (vectors_.empty()) return;
+        for (const auto& [name, vec] : vectors_) {
+            vec.save(vector_path(name));
+        }
+        std::string blob = "{\"version\":1,\"columns\":[";
+        bool first = true;
+        for (const auto& [name, vec] : vectors_) {
+            if (!first) blob += ",";
+            first = false;
+            blob += vec.metadata();
+        }
+        blob += "]}";
+        storage::detail::atomic_write(path_of(VECTORS_NAME),
+                                      path_of(VECTORS_NAME) + ".tmp", blob);
+    }
+
+    // Flush pending rebuilds, write everything derived, then snapshot.
+    //
+    // The derived files go *before* the store's checkpoint, which is the
+    // reverse of the obvious order and is deliberate: that call truncates the
+    // write-ahead log, and the embeddings are the one thing here with no log
+    // to be replayed from. Crashing between the two costs a stale schema and
+    // catalog, both of which the next open rebuilds.
     void checkpoint() {
         flush_dirty();
-        store_->checkpoint();
         save();
+        store_->checkpoint();
     }
 
     IndexCatalog::Freshness freshness(const std::string& name) const {
@@ -550,6 +998,22 @@ public:
                     "Table::validate: column '" + name + "' has " +
                     std::to_string(column.index->size()) + " index entries but " +
                     std::to_string(indexed) + " rows in the store carry a value");
+            }
+        }
+
+        for (const auto& [name, vec] : vectors_) {
+            vec.validate();
+            // The half VectorColumn cannot check for itself: it knows its keys
+            // are consistent with its rows, not that they are rows of *this*
+            // table. An embedding whose record is gone is a row knn() would
+            // return and get() could not fetch.
+            for (std::int64_t key : vec.keys()) {
+                if (store_->get(key) == nullptr) {
+                    throw std::logic_error(
+                        "Table::validate: vector column '" + name +
+                        "' holds an embedding for record " +
+                        std::to_string(key) + ", which is not in the store");
+                }
             }
         }
     }
@@ -918,8 +1382,22 @@ private:
     bool bitmap_conjunction(const std::vector<Predicate>& predicates,
                             std::vector<std::int64_t>* out,
                             QueryTrace* trace) const {
-        const ColumnIndex* first = nullptr;
+        Bitset mask;
+        if (!bitmap_mask(predicates, &mask, trace)) return false;
+        *out = columns_.at(predicates.front().column).index->decode(mask);
+        return true;
+    }
+
+    // The conjunction as a bit set, without decoding it.
+    //
+    // Split out from the above because the decode is exactly what a vector
+    // search does not want: it takes the bit set directly, so materialising
+    // the row ids first would hand back the entire saving at the door.
+    bool bitmap_mask(const std::vector<Predicate>& predicates, Bitset* out,
+                     QueryTrace* trace) const {
+        if (predicates.empty()) return false;
         std::size_t space = 0;
+        bool first = true;
         for (const Predicate& p : predicates) {
             if (!op_is_indexable(p.op) || p.op == PredOp::Between ||
                 p.op == PredOp::Prefix) {
@@ -930,20 +1408,19 @@ private:
             ensure_fresh(p.column);
             const ColumnIndex& index = *it->second.index;
             if (!index.has_bitmap()) return false;
-            if (first == nullptr) {
-                first = &index;
+            if (first) {
                 space = index.row_space();
+                first = false;
             } else if (index.row_space() != space) {
                 return false;
             }
         }
-        if (first == nullptr) return false;
 
-        index::Bitset mask;
+        Bitset mask;
         bool started = false;
         for (const Predicate& p : predicates) {
             const ColumnIndex& index = *columns_.at(p.column).index;
-            index::Bitset one = index.bitmap_for(compare_op_of(p.op), p.value);
+            Bitset one = index.bitmap_for(compare_op_of(p.op), p.value);
             if (!started) {
                 mask = std::move(one);
                 started = true;
@@ -951,7 +1428,7 @@ private:
                 mask &= one;
             }
         }
-        *out = first->decode(mask);
+        *out = std::move(mask);
         trace->used_index = true;
         trace->reason = "bitmap AND over " + std::to_string(predicates.size()) +
                         " columns, " + std::to_string((space + 63) / 64) +
@@ -1067,6 +1544,221 @@ private:
         return out;
     }
 
+    // ---- vector helpers ----------------------------------------------------
+
+    VectorColumn* require_vector(const std::string& name) {
+        return const_cast<VectorColumn*>(
+            static_cast<const Table*>(this)->require_vector(name));
+    }
+
+    const VectorColumn* require_vector(const std::string& name) const {
+        const auto it = vectors_.find(name);
+        if (it != vectors_.end()) return &it->second;
+        // Two distinct mistakes, and telling them apart is the difference
+        // between "you forgot a call" and "you meant a different column".
+        const ColumnDef& def = schema_.column(name);
+        if (def.type != LogicalType::Vector) {
+            throw std::invalid_argument(
+                "Table: column '" + name + "' is " + index::to_string(def.type) +
+                ", not a vector");
+        }
+        throw std::invalid_argument(
+            "Table: vector column '" + name +
+            "' has no index yet; call create_vector_index('" + name + "')");
+    }
+
+    // A planner holding this column's two structures and no columns at all.
+    //
+    // Cheap to build — two pointers and a threshold — which is what makes it
+    // right to build per query rather than to keep. HybridPlanner::set_column
+    // *copies* the index, so a planner held as a member would keep a second
+    // copy of every scalar index alive for the table's lifetime, and Table
+    // already owns the originals and resolves predicates through them.
+    HybridPlanner planner_for(const VectorColumn& vec) const {
+        HybridPlanner planner(prefilter_threshold_);
+        planner.set_exact(&vec.exact());
+        planner.set_graph(vec.graph());
+        return planner;
+    }
+
+    // The predicates as a bit set the vector search can use directly.
+    //
+    // Three things all have to hold, and each of them is a way of being wrong
+    // that would look plausible: every predicate must be served by a bitmap
+    // column, those columns must agree on what a position means, and a
+    // position must mean the *same row* in the vector index. The last is the
+    // one that only exists here — the table's positions are ranks in its key
+    // space and the vector index's are positions in a float buffer.
+    bool vector_mask(const std::vector<Predicate>& predicates,
+                     const VectorColumn& vec, Bitset* out,
+                     QueryTrace* trace) const {
+        if (!vec.rows_are_keys()) return false;
+        if (!bitmap_mask(predicates, out, trace)) return false;
+        if (out->size() != vec.rows()) {
+            *out = Bitset();
+            return false;
+        }
+        return true;
+    }
+
+    // Why the mask was unavailable, for the one caller that has to explain a
+    // refusal rather than quietly take another route.
+    std::string why_no_mask(const std::vector<Predicate>& predicates,
+                            const VectorColumn& vec) const {
+        if (!vec.rows_are_keys()) {
+            return "this column's row ids are not its record keys (" +
+                   std::to_string(vec.orphans()) +
+                   " orphaned rows), so a bit set over the table's rows would "
+                   "select different vectors than it names";
+        }
+        for (const Predicate& p : predicates) {
+            const auto it = columns_.find(p.column);
+            if (it == columns_.end() || !it->second.index) {
+                return "'" + p.column + "' has no index";
+            }
+            if (!it->second.index->has_bitmap()) {
+                return "'" + p.column + "' is a " +
+                       index::to_string(it->second.index->kind()) +
+                       ", not a bitmap";
+            }
+        }
+        return "the predicates and the bitmaps do not cover the same rows";
+    }
+
+    VectorInfo vector_info_of(const std::string& name, const ColumnDef& def,
+                              const VectorColumn* vec) const {
+        VectorInfo out;
+        out.name = name;
+        out.dim = def.dim;
+        if (vec == nullptr) return out;
+        out.indexed = true;
+        out.rows = vec->size();
+        out.orphans = vec->orphans();
+        out.structure = vec->plan().structure;
+        out.metric = vec->metric();
+        out.has_graph = vec->has_graph();
+        out.rows_are_keys = vec->rows_are_keys();
+        out.memory_bytes = vec->memory_bytes();
+        return out;
+    }
+
+    // Rebuild every vector column from vectors.json and its sidecars.
+    //
+    // Only the *vectors* are stored, never the graph. Replaying the same
+    // insertions in the same order with the seed fixed reproduces it exactly,
+    // so a reopen returns the same neighbours rather than merely similar ones
+    // — which is what makes that an assertion in the test suite instead of a
+    // hope. The cost is real and measured in
+    // scripts/experiment_vector_sidecar.py.
+    void load_vectors() {
+        const std::string blob = read_file(path_of(VECTORS_NAME));
+        if (blob.empty()) return;
+        using namespace hylis::storage::json_detail;
+        const char* p = blob.c_str();
+
+        skip_ws(p);
+        expect(p, '{');
+        while (true) {
+            skip_ws(p);
+            if (*p == '}') { ++p; break; }
+            const std::string key = read_string(p);
+            skip_ws(p);
+            expect(p, ':');
+            skip_ws(p);
+            if (key == "columns") {
+                expect(p, '[');
+                skip_ws(p);
+                if (*p == ']') { ++p; }
+                else {
+                    while (true) {
+                        load_one_vector_column(p);
+                        skip_ws(p);
+                        if (*p == ',') { ++p; continue; }
+                        if (*p == ']') { ++p; break; }
+                        throw std::runtime_error("vectors: expected , or ]");
+                    }
+                }
+            } else {
+                skip_value(p);
+            }
+            skip_ws(p);
+            if (*p == ',') { ++p; continue; }
+            if (*p == '}') { ++p; break; }
+            throw std::runtime_error("vectors: expected , or } at top level");
+        }
+    }
+
+    void load_one_vector_column(const char*& p) {
+        using namespace hylis::storage::json_detail;
+        std::string name;
+        std::size_t dim = 0;
+        VectorPlan plan;
+        std::vector<std::int64_t> keys;
+
+        skip_ws(p);
+        expect(p, '{');
+        skip_ws(p);
+        if (*p == '}') { ++p; return; }
+        while (true) {
+            skip_ws(p);
+            const std::string field = read_string(p);
+            skip_ws(p);
+            expect(p, ':');
+            skip_ws(p);
+            if (field == "name") {
+                name = read_string(p);
+            } else if (field == "dim") {
+                dim = static_cast<std::size_t>(read_int(p));
+            } else if (field == "metric") {
+                plan.metric = index::metric_from_string(read_string(p));
+            } else if (field == "structure") {
+                const std::string s = read_string(p);
+                if (!try_vector_structure_from_string(s, &plan.structure)) {
+                    throw std::runtime_error("vectors: unknown structure '" + s + "'");
+                }
+            } else if (field == "m") {
+                plan.M = static_cast<std::size_t>(read_int(p));
+            } else if (field == "ef_construction") {
+                plan.ef_construction = static_cast<std::size_t>(read_int(p));
+            } else if (field == "ef_search") {
+                plan.ef_search = static_cast<std::size_t>(read_int(p));
+            } else if (field == "seed") {
+                plan.seed = static_cast<std::uint64_t>(read_int(p));
+            } else if (field == "keys") {
+                keys = read_int_array(p);
+            } else {
+                skip_value(p);
+            }
+            skip_ws(p);
+            if (*p == ',') { ++p; continue; }
+            if (*p == '}') { ++p; break; }
+            throw std::runtime_error("vectors: expected , or } in a column");
+        }
+
+        // A stored sidecar for a column the schema no longer declares is a
+        // schema change the reconcile() rules already forbid; a *dimension*
+        // change is the same mistake one level down, and re-adding the floats
+        // under the new dimension would reinterpret every one of them.
+        const ColumnDef& def = schema_.column(name);
+        if (def.type != LogicalType::Vector || def.dim != dim) {
+            throw std::runtime_error(
+                "Table: vectors.json describes '" + name + "' as a " +
+                std::to_string(dim) + "-dimensional vector, and the schema "
+                "declares it as " + index::to_string(def.type) +
+                (def.type == LogicalType::Vector
+                     ? " of " + std::to_string(def.dim) + " dimensions"
+                     : ""));
+        }
+
+        VectorColumn column(name, dim, plan);
+        column.load(vector_path(name), keys);
+        vectors_.insert_or_assign(name, std::move(column));
+    }
+
+    fs::path vector_path(const std::string& name) const {
+        return store_->directory() / (name + ".fvecs");
+    }
+
     // ---- reopen ------------------------------------------------------------
 
     // A stored schema must still describe this table. Adding a column is fine
@@ -1114,8 +1806,15 @@ private:
     Schema schema_;
     IndexCatalog catalog_;
     std::map<std::string, Column> columns_;
+    std::map<std::string, VectorColumn> vectors_;
     std::size_t rebuilds_ = 0;
     bool deferring_ = false;
+    // The measured pre-filter crossover, handed to every planner this table
+    // builds. HybridPlanner::calibrate() finds a corpus's own; until it is
+    // called this is the ~50% one module 5 measured, and both are constants
+    // rather than a model on purpose — a learned cost model has to beat a
+    // stated baseline to have beaten anything.
+    double prefilter_threshold_ = 0.5;
 };
 
 }  // namespace hylis::query

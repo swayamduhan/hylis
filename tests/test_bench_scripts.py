@@ -346,6 +346,24 @@ def test_bitmap_planner_experiment_measures_both_claims():
     assert "explain():" in out
 
 
+def test_vector_sidecar_experiment_measures_reopen_and_orphans():
+    """E7. A vector column stores its floats and no graph, so a reopen replays
+    every insertion. Two things must hold: the replay reproduces the index
+    exactly (the seed is fixed, so 'the same neighbours' is the claim, not
+    'similar recall'), and the cost of that replay is reported rather than
+    assumed. The orphan arm prices what deletion leaves behind, since HNSW
+    cannot give a node back."""
+    if not optimised():
+        pytest.skip("unoptimised build; timings are refused by design")
+    proc, out = run("experiment_vector_sidecar.py", ["--quick"])
+    assert proc.returncode == 0, out
+    assert "FAILED" not in out, out
+    # Both result columns print 'yes' or 'NO'; either NO is a real defect.
+    assert " NO\n" not in out, out
+    assert "identical neighbours before and after" in out
+    assert "break-even" in out
+
+
 def test_printed_output_is_console_safe():
     """Windows consoles are cp1252 by default, and an em-dash in a print()
     has already cost this project one UnicodeEncodeError. Cheaper to assert
@@ -357,7 +375,8 @@ def test_printed_output_is_console_safe():
                    "experiment_write_path.py",
                    "experiment_bitmap_cardinality.py",
                    "experiment_conjunction.py",
-                   "experiment_bitmap_planner.py"):
+                   "experiment_bitmap_planner.py",
+                   "experiment_vector_sidecar.py"):
         text = (SCRIPTS / script).read_text(encoding="utf-8")
         for number, line in enumerate(text.split("\n"), start=1):
             stripped = line.lstrip()
@@ -376,7 +395,8 @@ def test_scripts_report_their_own_usage():
                    "experiment_write_path.py",
                    "experiment_bitmap_cardinality.py",
                    "experiment_conjunction.py",
-                   "experiment_bitmap_planner.py"):
+                   "experiment_bitmap_planner.py",
+                   "experiment_vector_sidecar.py"):
         proc, out = run(script, ["--help"])
         assert proc.returncode == 0, out
         assert "usage:" in out.lower()

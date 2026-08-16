@@ -145,6 +145,30 @@ inline std::vector<double> read_number_array(const char*& p) {
     return out;
 }
 
+// Reads a flat [n, n, ...] array of integers, exactly.
+//
+// Not read_number_array with a cast: record keys are int64 and doubles hold
+// only 53 bits of mantissa, so a key above 2^53 would come back as a
+// *different* key with no error reported anywhere. The one place this is used
+// — the row -> record key map of a vector column — is precisely where that
+// would silently associate an embedding with the wrong row.
+inline std::vector<std::int64_t> read_int_array(const char*& p) {
+    std::vector<std::int64_t> out;
+    skip_ws(p);
+    expect(p, '[');
+    skip_ws(p);
+    if (*p == ']') { ++p; return out; }
+    while (true) {
+        skip_ws(p);
+        out.push_back(read_int(p));
+        skip_ws(p);
+        if (*p == ',') { ++p; continue; }
+        if (*p == ']') { ++p; break; }
+        throw std::runtime_error("expected , or ] in integer array");
+    }
+    return out;
+}
+
 // Reads a flat {"str":"str", ...} object into a map.
 inline std::map<std::string, std::string> read_string_object(const char*& p) {
     std::map<std::string, std::string> out;

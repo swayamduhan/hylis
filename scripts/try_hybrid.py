@@ -15,11 +15,13 @@ only place the whole stack is visible at once -- the rows come back from the
 write-ahead log, and the index *decisions* come back from the catalog without
 being re-measured.
 
-Where the vectors live: alongside the table, not in it. A vector column is
-declarable in the schema but not yet stored (that is phase E), so here the row
-id is the record key and the embeddings sit in the two vector indexes. The
-arrangement is stated rather than hidden because it is the seam a reader should
-ask about.
+Where the vectors live: in the table, as a declared column, stored outside the
+record. A 128-float embedding base64s to ~700 bytes, so putting one in the JSON
+write-ahead log would make the log the dominant cost of the system; the floats
+go to the vector index instead and reach disk as a `.fvecs` sidecar at
+checkpoint. The consequence is worth knowing before you type `put_vector`:
+**embeddings are not write-ahead logged**, so `recover` shows them coming back
+from the last save rather than from the log.
 """
 
 from __future__ import annotations
@@ -44,19 +46,17 @@ except ImportError:
 try:
     from hylis import (
         ColumnDef,
-        FlatIndex,
-        HnswIndex,
-        HybridPlanner,
         IndexKind,
         LogicalType,
         Metric,
         PlanKind,
         PredOp,
-        Predicate,
         Record,
         RecordStore,
         Schema,
         Table,
+        VectorPlan,
+        VectorStructure,
     )
     from hylis import datasets as ds
 except ImportError as exc:  # pragma: no cover
@@ -82,8 +82,9 @@ HELP = """
     put <key> col=val ...    insert or update one record (durable)
     del <key>                delete one record
     get <key>                fetch one record from the store
-    checkpoint               snapshot, truncate the WAL, save the catalog
-    recover                  close and reopen: WAL replay + catalog replay
+    checkpoint               snapshot, truncate the WAL, save catalog+vectors
+    recover                  close and reopen: WAL replay, catalog replay,
+                             and the embeddings back from the .fvecs sidecar
 
   index
     index <col> [write_frac] build or re-tune, choosing by measurement
@@ -97,12 +98,17 @@ HELP = """
                              contains isnull
     and <col> <op> <val> ... two or more predicates, comma-separated
     count <col> <op> <val>   how many match, without producing them
-    knn <k> [qi]             vector only
+    knn <k> [qi]             vector only, graph and brute force side by side
+    like <key> [k]           more-like-this, seeded by a row already stored
     hybrid <col> <op> <val> <k> [qi]    predicate and vector together
     explain <col> <op> <val> <k>        the plan and why, no vector work
     plans <col> <op> <val> <k> [qi]     every legal plan, timed and compared
     calibrate                measure this corpus's crossover and adopt it
     ef <n>                   beam width; 0 for the index default
+
+  vectors
+    vectors                  the vector column: rows, orphans, memory
+    compact                  reclaim rows deletion could not (a full rebuild)
 
   verify
     check                    every query path against a brute-force scan
@@ -114,7 +120,7 @@ TITLES = ["nike air", "nike zoom", "adidas run", "puma go", "nikon lens",
           "reebok classic"]
 
 
-def schema_of() -> Schema:
+def schema_of(dim: int) -> Schema:
     return Schema([
         ColumnDef("price", LogicalType.Int64),
         ColumnDef("category", LogicalType.String),
@@ -122,10 +128,12 @@ def schema_of() -> Schema:
         ColumnDef("in_stock", LogicalType.Bool),
         ColumnDef("created_at", LogicalType.Timestamp),
         # A price band. Int64 and low-cardinality, which is what makes the
-        # bitmap plan reachable from here: the planner's vector filter works in
-        # row ids, so a bit set can only be used as a mask when the column is
-        # int64 *and* covers the corpus densely.
+        # bitmap plan reachable from here: the vector filter works in row ids,
+        # so a bit set can only be used as a mask when the column is int64
+        # *and* its positions are the vector column's rows.
         ColumnDef("band", LogicalType.Int64),
+        # The embedding. Declared in the schema, stored outside the record.
+        ColumnDef("image", LogicalType.Vector, dim),
     ])
 
 
@@ -134,9 +142,6 @@ class Playground:
         self.root = Path(tempfile.mkdtemp(prefix="hylis_demo_"))
         self.store: RecordStore | None = None
         self.table: Table | None = None
-        self.exact: FlatIndex | None = None
-        self.graph: HnswIndex | None = None
-        self.planner: HybridPlanner | None = None
         self.base: np.ndarray | None = None
         self.queries: np.ndarray | None = None
         self.ef = 0
@@ -164,7 +169,7 @@ class Playground:
         shutil.rmtree(self.root, ignore_errors=True)
         self.root.mkdir(parents=True, exist_ok=True)
         self.store = RecordStore(str(self.root / "shop"))
-        self.table = Table(self.store, schema_of())
+        self.table = Table(self.store, schema_of(vectors.dim))
 
         rng = np.random.default_rng(0)
         rows = []
@@ -183,67 +188,21 @@ class Playground:
         load_seconds = time.perf_counter() - start
 
         start = time.perf_counter()
-        self.exact = FlatIndex(vectors.dim)
-        self.exact.add_batch(self.base)
-        flat_seconds = time.perf_counter() - start
+        self.table.create_vector_index(
+            "image", VectorPlan(structure=VectorStructure.Graph, metric=Metric.L2,
+                                M=16, ef_construction=200))
+        self.table.put_vectors("image", list(range(n)), self.base)
+        vector_seconds = time.perf_counter() - start
 
-        start = time.perf_counter()
-        self.graph = HnswIndex(vectors.dim, Metric.L2, M=16, ef_construction=200)
-        self.graph.add_batch(self.base)
-        graph_seconds = time.perf_counter() - start
-
+        info = self.table.vector_info("image")
         print(f"  {result.rows_created:,} records written and fsynced in "
               f"{load_seconds:.1f}s")
-        print(f"  flat index {flat_seconds*1000:.0f} ms, "
-              f"HNSW {graph_seconds*1000:.0f} ms over {n:,} x {vectors.dim}-d")
-        print("  the row id is the record key, and the embeddings sit beside the")
-        print("  table rather than in it -- vector columns in the schema are a")
-        print("  later phase")
-        self._rebuild_planner()
-
-    def _rebuild_planner(self) -> None:
-        """Rebuild the planner's column copies from the table.
-
-        The planner owns its columns and the table owns its own, so a column
-        indexed after this has to be re-attached. Two copies of the same index
-        is a real cost, and the honest reason for it is that ColumnIndex is
-        move-only with a single owner; sharing would need a lifetime story that
-        buys nothing at demo scale.
-        """
-        if self.table is None:
-            return
-        self.planner = HybridPlanner(0.5)
-        self.planner.set_exact(self.exact)
-        self.planner.set_graph(self.graph)
-        for info in self.table.describe():
-            if info.indexed and info.type == LogicalType.Int64:
-                self._attach(info.name)
-
-    def _attach(self, column: str) -> None:
-        """Copy one int64 column into the planner, as a bitmap when it can be.
-
-        Only int64 columns, and only for the planner: the vector filter takes
-        row ids, and the bit-set path additionally needs bit position i to mean
-        row id i.
-        """
-        if self.table is None or self.planner is None:
-            return
-        pairs = []
-        for record in self.table.scan():
-            text = record.columns.get(column)
-            if text is None:
-                continue
-            pairs.append((int(text), record.key))
-        pairs.sort()
-        keys = [k for k, _ in pairs]
-        rows = [r for _, r in pairs]
-        info = self.table.info(column)
-
-        plan = self.table.explain_column(column)
-        space = sorted(r.key for r in self.table.scan()) \
-            if info.kind == IndexKind.Bitmap else None
-        self.planner.set_column_index(column, LogicalType.Int64, keys, rows,
-                                      plan, space)
+        print(f"  {info.rows:,} x {info.dim}-d embeddings attached in "
+              f"{vector_seconds*1000:.0f} ms "
+              f"({info.memory_bytes/1e6:.1f} MB, exact index and graph)")
+        print("  the embeddings are a schema column stored outside the record:")
+        print("  a 128-float vector base64s to ~700 bytes, which would make the")
+        print("  JSON write-ahead log the dominant cost of the whole system")
 
     def _require(self) -> bool:
         if self.table is None:
@@ -262,7 +221,6 @@ class Playground:
         self._describe_one(info)
         print(f"    chosen by building and timing every legal candidate "
               f"({elapsed*1000:.0f} ms)")
-        self._attach_if_int64(column)
 
     def create_index_as(self, column: str, kind_name: str) -> None:
         if not self._require():
@@ -279,11 +237,6 @@ class Playground:
         self._describe_one(info)
         print("    forced, not measured -- choose_index times lookups and")
         print("    writes, which is the wrong benchmark for a counting column")
-        self._attach_if_int64(column)
-
-    def _attach_if_int64(self, column: str) -> None:
-        if self.table.schema.type_of(column) == LogicalType.Int64:
-            self._attach(column)
 
     def _describe_one(self, info) -> None:
         kind = str(info.kind).split(".")[-1]
@@ -324,7 +277,6 @@ class Playground:
             return
         print(f"  {'dropped' if self.table.drop_index(column) else 'no index on'} "
               f"{column}; it still answers, by scanning")
-        self._rebuild_planner()
 
     # -- structured queries -------------------------------------------------
 
@@ -397,18 +349,52 @@ class Playground:
     # -- vector and hybrid --------------------------------------------------
 
     def knn(self, k: int, qi: int = 0) -> None:
+        """The graph and brute force on the same query, side by side.
+
+        Both stay selectable on purpose. The exact scan is the only exact
+        answer, so it is what recall is defined against -- a graph that
+        replaced it would leave "is it correct?" unanswerable.
+        """
         if not self._require() or self.queries is None:
             return
         q = self.queries[qi % len(self.queries)]
+
         start = time.perf_counter()
-        found = self.graph.search(q, k, self.ef)
-        elapsed = time.perf_counter() - start
-        print(f"  {len(found)} neighbours in {elapsed*1e6:.0f} us "
-              f"({self.graph.last_visited:,} nodes visited)")
-        for rank, n in enumerate(found):
-            record = self.table.get(n.id)
+        approx = self.table.knn("image", q, k=k, ef=self.ef)
+        graph_us = (time.perf_counter() - start) * 1e6
+        start = time.perf_counter()
+        truth = self.table.knn("image", q, k=k, exact=True)
+        exact_us = (time.perf_counter() - start) * 1e6
+
+        overlap = len(set(n.key for n in approx) & set(n.key for n in truth))
+        print(f"  graph {graph_us:>8.0f} us   brute force {exact_us:>8.0f} us   "
+              f"recall@{k} {overlap}/{len(truth)}")
+        for rank, n in enumerate(approx):
+            record = self.table.get(n.key)
             label = record.columns.get("category", "?") if record else "?"
-            print(f"    {rank:>3}. row {n.id:<7} d={n.score:<12.4f} {label}")
+            print(f"    {rank:>3}. key {n.key:<7} d={n.score:<12.4f} {label}")
+
+    def like(self, key: int, k: int = 5) -> None:
+        """More-like-this, seeded by a row already in the table."""
+        if not self._require():
+            return
+        record = self.table.get(key)
+        if record is None:
+            print(f"  no record {key}")
+            return
+        try:
+            found = self.table.knn_by_key("image", key, k=k, ef=self.ef)
+        except (ValueError, RuntimeError) as exc:
+            print(f"  {exc}")
+            return
+        print(f"  like {key} ({record.columns.get('title','?')}, "
+              f"{record.columns.get('category','?')}):")
+        print("    the seed is excluded; a row is always its own nearest")
+        print("    neighbour, so returning it would spend one of the k")
+        for rank, n in enumerate(found):
+            other = self.table.get(n.key)
+            print(f"    {rank:>3}. key {n.key:<7} d={n.score:<12.4f} "
+                  f"{other.columns.get('title','?') if other else '?'}")
 
     def hybrid(self, column: str, op_name: str, value: str, k: int, qi: int = 0) -> None:
         if not self._require() or self.queries is None:
@@ -418,53 +404,40 @@ class Playground:
             return
         q = self.queries[qi % len(self.queries)]
 
-        if self.planner is not None and self.planner.has_column(column) \
-                and op_name in ("eq", "lt", "le", "gt", "ge"):
-            predicate = Predicate(column, parsed[1], parsed[2])
-            start = time.perf_counter()
-            found, plan = self.planner.search(predicate, q, k=k, ef=self.ef)
-            elapsed = time.perf_counter() - start
-            self._show_plan(plan)
-            print(f"  {len(found)} neighbours in {elapsed*1e6:.0f} us")
-        else:
-            # Anything the planner cannot express itself -- a string predicate,
-            # a Contains, an IsNull -- still gets a planned vector search: the
-            # table resolves the rows and hands them over.
-            keys, trace = self.table.select_keys(*parsed)
-            start = time.perf_counter()
-            found, plan = self.planner.search_rows(keys, q, k=k, ef=self.ef)
-            elapsed = time.perf_counter() - start
-            print(f"  rows from the table: {trace.reason}")
-            self._show_plan(plan)
-            print(f"  {len(found)} neighbours in {elapsed*1e6:.0f} us")
+        start = time.perf_counter()
+        found, trace = self.table.hybrid([parsed], "image", q, k=k, ef=self.ef)
+        elapsed = time.perf_counter() - start
 
+        print(f"  rows from the table: {trace.structured.reason}")
+        self._show_plan(trace)
+        print(f"  {len(found)} neighbours in {elapsed*1e6:.0f} us")
         for rank, n in enumerate(found):
-            record = self.table.get(n.id)
+            record = self.table.get(n.key)
             got = record.columns.get(column, "?") if record else "?"
-            print(f"    {rank:>3}. row {n.id:<7} d={n.score:<12.4f} {column}={got}")
+            print(f"    {rank:>3}. key {n.key:<7} d={n.score:<12.4f} {column}={got}")
 
-    def _show_plan(self, plan) -> None:
+    def _show_plan(self, trace) -> None:
+        plan = trace.plan
         print(f"  plan: {str(plan.kind).split('.')[-1]}  "
               f"({plan.matched_rows:,}/{plan.corpus_rows:,} rows, "
               f"{plan.selectivity:.1%})")
         print(f"    {plan.reason}")
         if plan.selectivity_was_free:
             print("    the selectivity cost a popcount; no row id was produced")
+        if trace.without_vector:
+            print(f"    {trace.without_vector:,} matching rows carry no embedding "
+                  f"and so cannot be neighbours")
 
     def explain(self, column: str, op_name: str, value: str, k: int) -> None:
         if not self._require():
             return
         parsed = self._predicate(column, op_name, value)
-        if parsed is None or self.planner is None:
+        if parsed is None:
             return
-        if not self.planner.has_column(column):
-            print(f"  the planner has no copy of '{column}'; `index {column}` first")
-            return
-        predicate = Predicate(column, parsed[1], parsed[2])
         start = time.perf_counter()
-        plan = self.planner.explain(predicate, k)
+        trace = self.table.explain_hybrid([parsed], "image", k)
         elapsed = time.perf_counter() - start
-        self._show_plan(plan)
+        self._show_plan(trace)
         print(f"    deciding took {elapsed*1e6:.1f} us")
 
     def plans(self, column: str, op_name: str, value: str, k: int, qi: int = 0) -> None:
@@ -474,19 +447,17 @@ class Playground:
         planner does, and it can return fewer than k rows however large the
         corpus is -- that is a correctness cost, not a slow one.
         """
-        if not self._require() or self.queries is None or self.planner is None:
+        if not self._require() or self.queries is None:
             return
         parsed = self._predicate(column, op_name, value)
-        if parsed is None or not self.planner.has_column(column):
-            print(f"  the planner has no copy of '{column}'; `index {column}` first")
+        if parsed is None:
             return
-        predicate = Predicate(column, parsed[1], parsed[2])
         q = self.queries[qi % len(self.queries)]
-        chosen = self.planner.explain(predicate, k)
+        chosen = self.table.explain_hybrid([parsed], "image", k)
 
-        print(f"  {chosen.matched_rows:,}/{chosen.corpus_rows:,} rows match "
-              f"({chosen.selectivity:.1%}); planner chose "
-              f"{str(chosen.kind).split('.')[-1]}")
+        print(f"  {chosen.plan.matched_rows:,}/{chosen.plan.corpus_rows:,} rows "
+              f"match ({chosen.plan.selectivity:.1%}); planner chose "
+              f"{str(chosen.plan.kind).split('.')[-1]}")
         print()
         print(f"    {'plan':<24}{'us':>10}{'rows':>7}{'agrees':>9}")
         print("    " + "-" * 48)
@@ -494,38 +465,75 @@ class Playground:
         truth = None
         for kind in (PlanKind.PreFilter, PlanKind.FilteredGraph,
                      PlanKind.BitmapFilteredGraph, PlanKind.PostFilter):
-            if not self.planner.plan_available(kind, predicate):
+            if not self.table.plan_available(kind, [parsed], "image"):
                 print(f"    {str(kind).split('.')[-1]:<24}{'n/a':>10}"
-                      f"{'':>7}{'':>9}   needs a bitmap column")
+                      f"{'':>7}{'':>9}   needs a bitmap column over these rows")
                 continue
             start = time.perf_counter()
             for _ in range(3):
-                found = self.planner.search_with(kind, predicate, q, k=k, ef=self.ef)
+                found, _ = self.table.hybrid_with(kind, [parsed], "image", q,
+                                                  k=k, ef=self.ef)
             elapsed = (time.perf_counter() - start) / 3
-            ids = [n.id for n in found]
+            keys = [n.key for n in found]
             if truth is None:
-                truth = ids
-            agrees = "yes" if ids == truth else "NO"
+                truth = keys
+            agrees = "yes" if keys == truth else "NO"
             print(f"    {str(kind).split('.')[-1]:<24}{elapsed*1e6:>10.0f}"
-                  f"{len(ids):>7}{agrees:>9}")
+                  f"{len(keys):>7}{agrees:>9}")
         print()
         print("    post-filter returning fewer than k is not slowness, it is a")
         print("    wrong answer -- and it is what a system without a planner does")
 
     def calibrate(self) -> None:
-        if not self._require() or self.planner is None or self.queries is None:
+        if not self._require() or self.queries is None:
             return
-        columns = self.planner.columns()
-        if not columns:
-            print("  no column attached to the planner yet")
-            return
-        before = self.planner.prefilter_threshold
-        measured = self.planner.calibrate(columns[0], self.queries[:30],
-                                          k=10, ef=self.ef or 64)
+        before = self.table.prefilter_threshold
+        measured = self.table.calibrate("image", self.queries[:30], k=10,
+                                        ef=self.ef or 64)
         print(f"  crossover measured at {measured:.1%} on this corpus "
               f"(was {before:.0%})")
         print("  the inherited default came from a different corpus at a")
         print("  different ef, and the crossover moves with both")
+        print("  no scalar column is involved: the synthetic filters are cut")
+        print("  from the vector column's own rows")
+
+    # -- vector maintenance -------------------------------------------------
+
+    def vectors(self) -> None:
+        if not self._require():
+            return
+        for info in self.table.describe_vectors():
+            if not info.indexed:
+                print(f"  {info.name}: declared, no index yet")
+                continue
+            print(f"  {info.name}: {info.rows:,} rows x {info.dim}-d, "
+                  f"{str(info.structure).split('.')[-1]}, "
+                  f"{str(info.metric).split('.')[-1]}, "
+                  f"{info.memory_bytes/1e6:.1f} MB")
+            print(f"    {info.orphans:,} orphaned rows -- HNSW cannot give a node")
+            print("    back, so a delete masks rather than removes and the space")
+            print("    returns at `compact`")
+            if info.rows_are_keys:
+                print("    the row id is the record key, which is what lets a")
+                print("    table bitmap be handed to a vector search as a mask")
+            else:
+                print("    the row id is no longer the record key, so a table")
+                print("    bitmap can no longer mask a vector search here: bit")
+                print("    position i would name a different row in each")
+
+    def compact(self) -> None:
+        if not self._require():
+            return
+        info = self.table.vector_info("image")
+        if info.orphans == 0:
+            print("  nothing to reclaim")
+            return
+        start = time.perf_counter()
+        freed = self.table.compact_vectors("image")
+        print(f"  reclaimed {freed:,} rows in "
+              f"{(time.perf_counter()-start)*1000:.0f} ms")
+        print("    a full graph rebuild, which is why this is a command rather")
+        print("    than something a delete does on its own")
 
     # -- durability ---------------------------------------------------------
 
@@ -574,8 +582,13 @@ class Playground:
             return
         start = time.perf_counter()
         self.table.checkpoint()
-        print(f"  snapshot written, WAL truncated, catalog saved "
+        info = self.table.vector_info("image")
+        print(f"  snapshot written, WAL truncated, catalog and "
+              f"{info.rows:,} embeddings saved "
               f"({(time.perf_counter()-start)*1000:.0f} ms)")
+        print("    the .fvecs sidecar is the only durability the embeddings")
+        print("    have: they never go through the write-ahead log, because a")
+        print("    128-float vector would dominate a JSON log")
 
     def recover(self) -> None:
         """Close the store and reopen it from disk.
@@ -598,16 +611,20 @@ class Playground:
         self.table = Table.open(self.store)
         reopen = time.perf_counter() - start
 
+        info = self.table.vector_info("image")
         print(f"  reopened in {reopen*1000:.0f} ms")
         print(f"    {len(self.table):,} records recovered (was {before:,})")
         print(f"    schema read from disk: {len(self.table.schema)} columns")
         print(f"    catalog holds {len(self.table.catalog.columns())} decisions")
+        print(f"    {info.rows:,} embeddings read back from the .fvecs sidecar")
+        print("    the HNSW graph is not stored; it was replayed from the same")
+        print("    insertions, and because the seed is fixed it is the *same*")
+        print("    graph rather than a similar one")
         for name in indexed:
             start = time.perf_counter()
             self.table.create_index(name)
             print(f"    {name}: rebuilt in {(time.perf_counter()-start)*1000:.0f} ms "
                   f"by replaying the stored plan, not re-measuring it")
-        self._rebuild_planner()
 
     # -- verification -------------------------------------------------------
 
@@ -636,25 +653,48 @@ class Playground:
             if self.table.count("category", PredOp.Eq, value) != len(want):
                 problems.append(f"count(category == {value}) disagrees with select")
 
+        # The vector half, against numpy rather than against ourselves.
+        if self.base is not None and self.queries is not None:
+            live = self.table.vector_keys("image")
+            index = {key: i for i, key in enumerate(live)}
+            corpus = self.base[[key for key in live]]
+            for q in self.queries[:3]:
+                want = [live[i] for i in
+                        np.argsort(((corpus - q) ** 2).sum(axis=1))[:5]]
+                got = [n.key for n in self.table.knn("image", q, k=5, exact=True)]
+                if got != want:
+                    problems.append(f"exact knn disagrees with numpy: {got} vs {want}")
+                    break
+            # And the filter really filters.
+            hits, _ = self.table.hybrid([("category", PredOp.Eq, "shoes")],
+                                        "image", self.queries[0], k=10, ef=self.ef)
+            wrong = [h.key for h in hits
+                     if self.table.get(h.key).columns.get("category") != "shoes"]
+            if wrong:
+                problems.append(f"hybrid returned non-matching rows: {wrong}")
+            if index and set(h.key for h in hits) - set(live):
+                problems.append("hybrid returned a row with no embedding")
+
         if problems:
             print("  FAILED")
             for p in problems:
                 print(f"    - {p}")
         else:
             print(f"  ok: every index agrees with a scan of all "
-                  f"{len(rows):,} records")
+                  f"{len(rows):,} records, and the exact vector search agrees "
+                  f"with numpy")
 
     def stats(self) -> None:
         if not self._require():
             return
         print(f"  source   {self.source}")
         print(f"  records  {len(self.table):,}")
-        print(f"  vectors  {0 if self.base is None else len(self.base):,} x "
-              f"{0 if self.base is None else self.base.shape[1]}-d")
+        info = self.table.vector_info("image")
+        print(f"  vectors  {info.rows:,} x {info.dim}-d, {info.orphans:,} orphaned, "
+              f"{info.memory_bytes/1e6:.1f} MB")
         print(f"  ef       {self.ef or 'index default'}")
-        if self.planner is not None:
-            print(f"  planner  crossover {self.planner.prefilter_threshold:.0%}, "
-                  f"columns {self.planner.columns()}")
+        print(f"  planner  crossover {self.table.prefilter_threshold:.0%}, "
+              f"built per query from the table's own indexes")
         print(f"  writes   fsync per write; index maintenance is ~0.3% of one")
         print(f"  rebuilds {self.table.rebuilds()}")
 
@@ -712,6 +752,8 @@ def dispatch(pg: Playground, line: str) -> bool:
         elif cmd == "knn":
             pg.knn(int(args[0]) if args else 5,
                    int(args[1]) if len(args) > 1 else 0)
+        elif cmd == "like":
+            pg.like(int(args[0]), int(args[1]) if len(args) > 1 else 5)
         elif cmd == "hybrid":
             pg.hybrid(args[0], args[1].lower(), args[2], int(args[3]),
                       int(args[4]) if len(args) > 4 else 0)
@@ -724,6 +766,10 @@ def dispatch(pg: Playground, line: str) -> bool:
                      int(args[4]) if len(args) > 4 else 0)
         elif cmd == "calibrate":
             pg.calibrate()
+        elif cmd == "vectors":
+            pg.vectors()
+        elif cmd == "compact":
+            pg.compact()
         elif cmd == "ef":
             pg.ef = max(0, int(args[0]))
             print(f"  ef = {pg.ef or 'index default'}")
@@ -756,10 +802,13 @@ DEMO = [
     "as in_stock bitmap",
     "as band bitmap",
     "columns",
+    "vectors",
     "where category eq shoes",
     "where title prefix nike",
     "count in_stock eq true",
     "and category eq shoes, price lt 25000",
+    "knn 5",
+    "like 0 5",
     "explain price lt 5000 10",
     "explain price lt 45000 10",
     "explain band lt 4 10",
@@ -767,6 +816,9 @@ DEMO = [
     "plans band lt 4 5",
     "put 0 price=99 band=0 category=hats title=nike air in_stock=true created_at=2026-08-13",
     "get 0",
+    "del 1",
+    "vectors",
+    "compact",
     "check",
     "recover",
     "check",

@@ -30,6 +30,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace hylis::index {
@@ -39,6 +41,37 @@ enum class Metric {
     InnerProduct,  // dot product; larger is more similar
     Cosine,        // inner product on normalised vectors; larger is similar
 };
+
+// The metric's name, and back again.
+//
+// Needed because a vector column's metric is persisted: a sidecar of raw
+// floats is uninterpretable without it, since Cosine stores the *normalised*
+// form and reloading those vectors under L2 would answer a different question
+// while looking entirely plausible.
+inline const char* to_string(Metric metric) {
+    switch (metric) {
+        case Metric::L2: return "l2";
+        case Metric::InnerProduct: return "inner_product";
+        case Metric::Cosine: return "cosine";
+    }
+    return "l2";
+}
+
+inline bool try_metric_from_string(const std::string& name, Metric* out) {
+    if (name == "l2") { *out = Metric::L2; return true; }
+    if (name == "inner_product") { *out = Metric::InnerProduct; return true; }
+    if (name == "cosine") { *out = Metric::Cosine; return true; }
+    return false;
+}
+
+inline Metric metric_from_string(const std::string& name) {
+    Metric out = Metric::L2;
+    if (!try_metric_from_string(name, &out)) {
+        throw std::invalid_argument("unknown metric '" + name +
+                                    "'; one of l2, inner_product, cosine");
+    }
+    return out;
+}
 
 // One search result. `score` means whichever quantity the index's metric
 // measures: a Euclidean distance for L2, a dot product for InnerProduct, a

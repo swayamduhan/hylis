@@ -199,14 +199,28 @@ public:
             throw std::invalid_argument("HybridPlanner::calibrate: no column '" +
                                         column + "'");
         }
-        const std::size_t dim = graph_->dim();
-        const std::size_t n = corpus_size();
-        if (n == 0) return threshold_;
+        if (corpus_size() == 0) return threshold_;
 
         // All row ids, so a synthetic filter of any size can be cut from it
         // without depending on what the column's keys happen to look like.
         std::vector<ColumnValue> all = it->second.range_query(
             CompareOp::Ge, std::numeric_limits<ColumnKey>::min());
+        return calibrate_rows(all, queries, n_queries, k, ef, samples);
+    }
+
+    // The same measurement over row ids the caller supplies.
+    //
+    // Split out because the crossover is a property of the *corpus and the
+    // machine*, not of any column: a table whose vector column is the thing
+    // being calibrated has row ids to hand and no reason to own a scalar index
+    // just to produce them.
+    double calibrate_rows(const std::vector<ColumnValue>& all,
+                          const float* queries, std::size_t n_queries,
+                          std::size_t k, std::size_t ef = 0,
+                          std::size_t samples = 12) {
+        if (!exact_ || !graph_ || n_queries == 0 || samples < 2) return threshold_;
+        const std::size_t dim = graph_->dim();
+        if (corpus_size() == 0 || all.empty()) return threshold_;
 
         double last_scan_win = 0.0;
         double first_graph_win = 1.0;
@@ -244,6 +258,17 @@ public:
         std::vector<ColumnValue> matched;
         Bitset mask;
         return plan_for(predicate, k, &matched, &mask);
+    }
+
+    // The decision alone, for rows a caller has already resolved.
+    //
+    // Deliberately takes a count rather than the rows: the whole reason a
+    // bitmap column is worth having here is that it can say how many match
+    // without producing them, and an explain that demanded the list back would
+    // make that impossible to express.
+    QueryPlan explain_rows(std::size_t matched, std::size_t k,
+                           bool have_mask = false) const {
+        return plan_for_rows(matched, k, have_mask);
     }
 
     // The whole point of the module.
@@ -331,9 +356,41 @@ public:
                                       const float* query, std::size_t k,
                                       std::size_t ef = 0,
                                       QueryPlan* out_plan = nullptr) const {
-        QueryPlan plan = plan_for_rows(rows.size(), k);
+        QueryPlan plan = plan_for_rows(rows.size(), k, false);
         if (out_plan) *out_plan = plan;
         return execute(plan.kind, rows, Bitset(), query, k, ef);
+    }
+
+    // The same seam, for a caller holding a bit set instead of a row list.
+    //
+    // Worth its own entry point rather than making the caller decode: a bit
+    // set that reached here came from a popcount, so the selectivity was free
+    // and *nothing has been materialised yet*. Decoding it to call search_rows
+    // would hand back the entire saving at the door.
+    //
+    // Bit position i must mean row id i in the vector index. The caller checks
+    // — Table asks VectorColumn::rows_are_keys().
+    std::vector<Neighbor> search_mask(const Bitset& mask, const float* query,
+                                      std::size_t k, std::size_t ef = 0,
+                                      QueryPlan* out_plan = nullptr) const {
+        QueryPlan plan = plan_for_rows(mask.count(), k, true);
+        plan.selectivity_was_free = true;
+        if (out_plan) *out_plan = plan;
+        return execute(plan.kind, {}, mask, query, k, ef);
+    }
+
+    // Force a plan over rows or a mask the caller already holds.
+    //
+    // The counterpart of search_with for the two seams above, and it exists
+    // for the same reason: without it a test cannot assert that every legal
+    // plan returns the same rows, and a planner that can pick a fast *wrong*
+    // plan with nothing to catch it is the one failure mode a query optimiser
+    // must not have.
+    std::vector<Neighbor> execute_plan(PlanKind kind,
+                                       const std::vector<ColumnValue>& rows,
+                                       const Bitset& mask, const float* query,
+                                       std::size_t k, std::size_t ef = 0) const {
+        return execute(kind, rows, mask, query, k, ef);
     }
 
 private:
@@ -455,8 +512,11 @@ private:
     }
 
     // The same decision for rows a caller already has -- a conjunction Table
-    // resolved, or a predicate no index could serve.
-    QueryPlan plan_for_rows(std::size_t matched, std::size_t k) const {
+    // resolved, or a predicate no index could serve. `have_mask` says the
+    // caller supplied a bit set rather than a list, which changes only which
+    // of the two graph plans is reachable.
+    QueryPlan plan_for_rows(std::size_t matched, std::size_t k,
+                            bool have_mask) const {
         QueryPlan plan;
         plan.corpus_rows = corpus_size();
         plan.threshold = threshold_;
@@ -465,16 +525,50 @@ private:
                                ? static_cast<double>(matched) /
                                      static_cast<double>(plan.corpus_rows)
                                : 0.0;
-        if (matched == 0 || !graph_ || matched <= k ||
-            plan.selectivity <= threshold_) {
+        const std::string sel = two_dp(plan.selectivity * 100.0) + "%";
+        const std::string from =
+            have_mask ? " came from a popcount over a bit set the caller already"
+                        " held"
+                      : " over rows the caller resolved";
+
+        if (matched == 0) {
             plan.kind = PlanKind::PreFilter;
-            plan.reason = "selectivity " + two_dp(plan.selectivity * 100.0) +
-                          "% over rows supplied by the caller";
+            plan.reason = "no row matches; no vector search needed";
+            return plan;
+        }
+        if (!graph_) {
+            plan.kind = PlanKind::PreFilter;
+            plan.reason = "no graph attached; the exact index is the only option";
+            return plan;
+        }
+        if (matched <= k) {
+            plan.kind = PlanKind::PreFilter;
+            plan.reason = "matches (" + std::to_string(matched) +
+                          ") do not exceed k (" + std::to_string(k) +
+                          "); every match is in the answer";
+            return plan;
+        }
+        if (plan.selectivity <= threshold_) {
+            plan.kind = PlanKind::PreFilter;
+            plan.reason = "selectivity " + sel + from + ", at or below the " +
+                          two_dp(threshold_ * 100.0) +
+                          "% crossover; an exact scan of the survivors is "
+                          "cheaper than making the graph step through them";
+            return plan;
+        }
+        if (have_mask) {
+            plan.kind = PlanKind::BitmapFilteredGraph;
+            plan.reason = "selectivity " + sel + from + ", above the " +
+                          two_dp(threshold_ * 100.0) +
+                          "% crossover; the graph takes the bit set directly, "
+                          "so no row id is materialised at all";
             return plan;
         }
         plan.kind = PlanKind::FilteredGraph;
-        plan.reason = "selectivity " + two_dp(plan.selectivity * 100.0) +
-                      "% over rows supplied by the caller";
+        plan.reason = "selectivity " + sel + from + ", above the " +
+                      two_dp(threshold_ * 100.0) +
+                      "% crossover; the graph rejects few enough nodes to stay "
+                      "worth its speedup";
         return plan;
     }
 
@@ -495,6 +589,12 @@ private:
                     throw std::logic_error(
                         "HybridPlanner: the pre-filter plan needs the exact "
                         "index, which was never attached");
+                }
+                // The row list wins when there is one; a caller who arrived
+                // through search_mask has only the bit set, and decoding it
+                // here would spend exactly what the bit set was chosen to save.
+                if (matched.empty() && mask.size() != 0) {
+                    return exact_->search_masked(query, k, mask);
                 }
                 return exact_->search_filtered(query, k, matched);
             }

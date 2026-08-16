@@ -23,7 +23,7 @@ FAISS / hnswlib / etc. (those are benchmark baselines only).
 | 6 | Neural Router       | ✅ |
 | 7 | Incremental retrain | ✅ |
 | 8 | Query planner       | ✅ |
-| 9 | Typed columns       | ◐ phases A–D of 5 |
+| 9 | Typed columns       | ✅ |
 | 10| Benchmarks          | ☐ |
 | 11| Demo CLI            | ✅ |
 
@@ -44,16 +44,24 @@ That was module 8, and it is now built. The rest, ranked by value:
 Starting it turned up a problem *underneath* the wiring: `ColumnIndex` was
 hard-wired to `int64 → int64`, which is fine for a synthetic key array and
 wrong for a table with prices, categories, titles, flags and timestamps. So the
-typed column layer came first, and the join followed. What remains of it: a
-bitmap family for `Bool` and low-cardinality columns, typed predicates through
-the planner, and vectors declared in the schema but stored outside the record —
-a 128-float embedding is ~700 bytes of base64 per row and would make the
+typed column layer came first, and the join followed — through a bitmap family
+for `Bool` and low-cardinality columns, typed predicates through the planner,
+and finally vectors declared in the schema and stored outside the record. A
+128-float embedding is ~700 bytes of base64 per row, which would have made the
 write-ahead log the dominant cost of the system.
 
-**3. Vector deletion.** Module 7 made the structured side fully mutable, but
-`HnswIndex` and `FlatIndex` stay append-only, so `DynamicRMIndex::erase` has no
-vector counterpart. The design is already owned: tombstone, filter at search,
-compact at rebuild — identical to `dynamic_rmi.hpp`.
+**3. Vector deletion, and graph serialisation.** A vector column now deletes
+logically — the row leaves every answer at once and its space returns at a
+compaction, the same trade `dynamic_rmi.hpp` makes. What is still missing is
+deletion *in the graph*: `HnswIndex` cannot give a node back, so a deleted row
+stays a node nothing can reach. E7 measured what that costs and the answer
+lowered its priority rather than raising it — orphans are inside the run-to-run
+spread below half the corpus.
+
+The item that gained evidence instead is **graph serialisation**. The sidecar
+stores vectors and not the graph, so every reopen replays every insertion:
+**109× the cost of reading the vectors back**. That is now a roadmap item with
+a number rather than a hypothetical improvement.
 
 **4. The router during insertion.** The real research item, and the known
 limitation this README already states below: insertion still descends the
@@ -61,7 +69,7 @@ hierarchy, which is why the layer-0-only build does not scale. Highest research
 value, highest risk.
 
 **5. ~~Module 11, the demo CLI.~~** ✅ Done — `scripts/try_hybrid.py`, below.
-Module 10 is largely done too: fourteen benchmark and experiment scripts exist,
+Module 10 is largely done too: fifteen benchmark and experiment scripts exist,
 and what remains is consolidation rather than new work.
 
 ## Typed columns
@@ -193,6 +201,72 @@ One honest gap, and it is why `create_index_as` exists: `choose_index` times
 lookups and writes, not `count()`, so a counting workload is judged on the one
 operation the bitmap is worst at.
 
+## Vector columns
+
+An embedding belongs to a row, and it does not belong in the row. A 128-float
+vector base64s to ~700 bytes, so putting one in `Record::columns` would make the
+JSON write-ahead log the dominant cost of the whole system and make every
+checkpoint parse megabytes of base64 to recover data the indexes rebuild
+anyway. So a `Vector` column is **declared in the schema and stored outside the
+record**.
+
+```python
+schema.add(ColumnDef("image", LogicalType.Vector, dim=128))
+table.create_vector_index("image", VectorPlan(structure=VectorStructure.Graph))
+table.put_vectors("image", keys, embeddings)         # (n, 128) float32
+
+table.knn("image", query, k=10)                      # record keys, not row ids
+table.knn("image", query, k=10, exact=True)          # brute force, still selectable
+table.knn_by_key("image", 42, k=10)                  # more-like-this
+table.hybrid([("price", PredOp.Lt, 5000)], "image", query, k=10)
+```
+
+**Two id spaces meet here, and joining them is the work.** Every scalar index
+maps `value → record key`, which is why nothing is ever renumbered. A vector
+index cannot: its ids are dense positions into one contiguous float buffer,
+because that buffer is what makes a sequential sweep fast. So a vector column
+owns the translation both ways, and a hybrid query pays `O(matches)` hash
+lookups for it — the price of the scalar half staying exact.
+
+When row id *does* equal record key, `rows_are_keys()` says so, and that is the
+precondition for handing a *table bitmap* to a vector search as a mask: bit
+position *i* must mean the same row in both. One delete ends it, and the demo
+prints that the moment it happens.
+
+**Deletion leaves a hole.** HNSW cannot give a node back, so erasing a row — or
+replacing its embedding — masks it rather than removing it. The row leaves every
+answer immediately; the space returns at `compact_vectors()` or at the next
+reopen.
+
+**Embeddings are not write-ahead logged.** They reach disk at `save_vectors()`,
+which `checkpoint()` calls, as a `.fvecs` sidecar plus a JSON map from row to
+record key. A crash between two saves loses every embedding attached since the
+last one while the records themselves survive. That is the cost of keeping them
+out of the WAL, it has a test in each language whose only job is to assert it,
+and the fix — a typed binary WAL payload — is a rewrite of module 1's format.
+
+The sidecar is TEXMEX `.fvecs` because `datasets.read_fvecs` already reads it;
+a private format would have been easier to write and impossible to inspect.
+
+```bash
+python scripts/experiment_vector_sidecar.py   # E7: reopen cost, and orphans
+```
+
+**E7, part A — the graph is reproduced, not approximated.** Only the vectors are
+stored, so a reopen replays every insertion. `HnswIndex` takes a seed and
+`clear()` reseeds it, so the replay builds *the same graph*: every query
+returned identical neighbours before and after, rank for rank. That turns
+"recall after reload" from a measurement into an assertion, with no format
+version to maintain. It costs **1104 ms against a 10 ms read** at 20k × 32-d —
+109×, which is what makes graph serialisation a roadmap item.
+
+**E7, part B — orphans are close to free.** At 20,000 rows, deleting 1%, 5% or
+20% left search cost inside the run-to-run spread. Only at half the corpus did a
+real cost appear (1.17×), and even there compaction is a full graph rebuild
+that takes **123,508 queries** to repay. So `compact_vectors()` is an explicit
+command rather than something a delete does — with the break-even as the
+reason rather than a preference.
+
 ## The demo
 
 ```bash
@@ -205,23 +279,31 @@ durable store, per-column indexes chosen by measurement, a predicate, a vector
 search over the survivors, and the planner's own account of why:
 
 ```
-> explain price lt 45000 10   -> FilteredGraph,       deciding took 141.9 us
-> explain band  lt 4     10   -> BitmapFilteredGraph, deciding took   8.0 us
+> knn 5
+    graph 62 us   brute force 223 us   recall@5 5/5
+
+> explain price lt 45000 10   -> FilteredGraph,       deciding took 930.4 us
+> explain band  lt 4     10   -> BitmapFilteredGraph, deciding took  13.5 us
 
 > plans band lt 4 5
     plan                            us   rows   agrees
-    PreFilter                      229      5      yes
-    FilteredGraph                   46      5      yes
-    BitmapFilteredGraph             18      5      yes
-    PostFilter                      98      5      yes
+    PreFilter                      319      5      yes
+    FilteredGraph                  141      5      yes
+    BitmapFilteredGraph            131      5      yes
+    PostFilter                     213      5      yes
 
 > recover
-    20,000 records recovered from the write-ahead log
+    19,999 records recovered from the write-ahead log
+    19,999 embeddings read back from the .fvecs sidecar
     price: rebuilt by replaying the stored plan, not re-measuring it
 ```
 
-`recover` is the moment worth watching: the rows come back from module 1 and
-the *decisions* come back from module 4, without the expensive half repeating.
+`recover` is the moment worth watching: the rows come back from module 1, the
+*decisions* come back from module 4 without the expensive half repeating, and
+the embeddings come back from a sidecar that never went through the log.
+
+The two `explain` lines are E5 in the demo — 69× here, on a column where the
+ordered index has to produce 18,025 row ids to learn how many there are.
 
 **E5** measures what a bitmap column buys the planner. `explain()` gets
 **1.5×–7.9× cheaper, and the gain grows with selectivity** — which is exactly
@@ -263,7 +345,7 @@ cpp/
     storage/    # record store + write-ahead log (header-only)
     index/      # B+ tree, RMI, logical types, per-column selection,
                 #   flat + HNSW vector search
-    query/      # schema, predicates, table, hybrid query planner
+    query/      # schema, predicates, table, vector columns, hybrid planner
   bindings/     # pybind11 -> hylis._storage, _btree, _flat, _rmi, _hnsw,
                 #   _planner, _schema, _table
   tests/        # GoogleTest suites for the C++ core
